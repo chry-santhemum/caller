@@ -1,5 +1,5 @@
 # %%
-"""API client."""
+"""API caller class."""
 import os
 import random
 import dotenv
@@ -42,26 +42,6 @@ from llm_types import (
 
 
 logger = logging.getLogger(__name__)
-# Models for which caching is disabled by default.
-# - Exact names go into NO_CACHE_MODELS
-# - Prefixes (e.g., vendor/model-family) go into NO_CACHE_MODEL_PREFIXES
-# By default, disable caching for LLaMA family via the meta-llama/ prefix.
-NO_CACHE_MODELS: list[str] = []
-NO_CACHE_MODEL_PREFIXES: list[str] = [
-    "meta-llama/",
-]
-
-
-def _is_cache_disabled_for_model(model_name: str) -> bool:
-    # Optional global kill-switch
-    if os.getenv("DISABLE_API_CACHE") is not None:
-        return True
-    if model_name in NO_CACHE_MODELS:
-        return True
-    for prefix in NO_CACHE_MODEL_PREFIXES:
-        if model_name.startswith(prefix):
-            return True
-    return False
 
 
 def is_thinking_model(model_name: str) -> bool:
@@ -246,7 +226,7 @@ class OpenrouterCaller(Caller):
     # UPDATE (Atticus): use new reasoning format for OpenRouter
     async def call(
         self,
-        messages: ChatHistory | Sequence[ChatMessage],  # backwards compat
+        messages: ChatHistory | Sequence[ChatMessage],
         config: InferenceConfig,
         tool_args: ToolArgs | None = None,
     ) -> OpenaiResponse:

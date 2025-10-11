@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets
+.env
+
+# Orchestra
+.designer.md.swp
+.mcp.json
