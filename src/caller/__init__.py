@@ -7,8 +7,13 @@ Example:
     from caller import Caller
 
     caller = Caller()
-    response = await caller.call("Hello!", model="anthropic/claude-3.5-sonnet")
+
+    # Single call
+    response = await caller.call_one("Hello!", model="anthropic/claude-3.5-sonnet")
     print(response.first_response)
+
+    # Batch calls with shared parameters
+    responses = await caller.call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
 """
 
 from caller.caller import (

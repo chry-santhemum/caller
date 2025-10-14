@@ -25,7 +25,7 @@ async def basic_usage():
     )
 
     # One message
-    response = await caller.call(
+    response = await caller.call_one(
         messages="What is the capital of France?",
         model="anthropic/claude-3.5-haiku",
         max_tokens=50,
@@ -35,26 +35,22 @@ async def basic_usage():
     print(f"Tokens used: {response.usage}")
 
 
-    # Multiple messages
+    # Multiple messages with shared parameters
     questions = [
         "What is the capital of Japan?",
         "What is the capital of Germany?",
         "What is the capital of Brazil?",
     ]
 
-    requests = [
-        {
-            "messages": question,
-            "model": "anthropic/claude-3.5-haiku",
-            "max_tokens": 30,
-        }
-        for question in questions
-    ]
+    print(f"Processing {len(questions)} questions in parallel...\n")
 
-    print(f"Processing {len(requests)} questions in parallel...\n")
-
-    # Process in parallel
-    responses = await caller.call_batch(requests, max_parallel=3)
+    # Process in parallel with shared parameters
+    responses = await caller.call(
+        questions,
+        model="anthropic/claude-3.5-haiku",
+        max_tokens=30,
+        max_parallel=3
+    )
 
     for question, response in zip(questions, responses):
         print(f"Q: {question}")
@@ -63,7 +59,7 @@ async def basic_usage():
 
     # Use as context manager
     async with caller:
-        response = await caller.call(
+        response = await caller.call_one(
             messages="What is async/await?",
             model="anthropic/claude-3.5-haiku",
             max_tokens=100,
@@ -79,7 +75,7 @@ async def different_providers():
     caller = Caller()
 
     # Default: all models use OpenRouter
-    response = await caller.call(
+    response = await caller.call_one(
         messages="Say hello",
         model="anthropic/claude-3.5-haiku",  # via OpenRouter
         max_tokens=10,
@@ -87,7 +83,7 @@ async def different_providers():
     print(f"   {response.first_response}")
 
     # Explicitly use Anthropic Direct API
-    response = await caller.call(
+    response = await caller.call_one(
         messages="Say hello",
         model="claude-sonnet-4-5-20250929",
         provider="anthropic",  # Explicit override
@@ -96,7 +92,7 @@ async def different_providers():
     print(f"   {response.first_response}")
 
     # Explicitly use OpenAI Direct API
-    response = await caller.call(
+    response = await caller.call_one(
         messages="Say hello",
         model="gpt-5-mini",
         provider="openai",  # Explicit override
@@ -116,18 +112,18 @@ async def cache_demo():
 
     print("First call (hits API)...")
     with timer("API call"):
-        response1 = await caller.call(message, model=model, max_tokens=10)
+        response1 = await caller.call_one(message, model=model, max_tokens=10)
     print(f"  Response: {response1.first_response}")
 
     print("\nSecond call (hits cache)...")
     with timer("Cache hit"):
-        response2 = await caller.call(message, model=model, max_tokens=10)
+        response2 = await caller.call_one(message, model=model, max_tokens=10)
     print(f"  Response: {response2.first_response}")
     print(f"  Same as first? {response1.first_response == response2.first_response}")
 
     print("\nThird call with different parameters (hits API)...")
     with timer("API call"):
-        response3 = await caller.call(message, model=model, max_tokens=10, temperature=0.9)
+        response3 = await caller.call_one(message, model=model, max_tokens=10, temperature=0.9)
     print(f"  Response: {response3.first_response}")
 
 

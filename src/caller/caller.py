@@ -303,10 +303,15 @@ class Caller:
 
     Usage:
         caller = Caller()
-        response = await caller.call(messages, model="anthropic/claude-3.5-sonnet")
+
+        # Single call
+        response = await caller.call_one(messages, model="anthropic/claude-3.5-sonnet")
+
+        # Batch calls with shared parameters
+        responses = await caller.call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
 
         # Or synchronously
-        response = caller.call_sync(messages, model="gpt-4")
+        response = caller.call_one_sync(messages, model="gpt-4")
     """
 
     def __init__(
@@ -388,7 +393,7 @@ class Caller:
             return provider_override
         return self.default_provider
 
-    async def call(
+    async def call_one(
         self,
         messages: ChatHistory | Sequence[ChatMessage] | str,
         model: str,
@@ -699,17 +704,17 @@ class Caller:
 
         return response
 
-    def call_sync(
+    def call_one_sync(
         self,
         messages: ChatHistory | Sequence[ChatMessage] | str,
         model: str,
         **kwargs
     ) -> OpenaiResponse:
         """
-        Synchronous wrapper around async call().
+        Synchronous wrapper around async call_one().
 
         Args:
-            Same as call()
+            Same as call_one()
 
         Returns:
             OpenaiResponse
@@ -717,33 +722,63 @@ class Caller:
         try:
             asyncio.get_running_loop()
             raise RuntimeError(
-                "call_sync() cannot be called from an async context. "
-                "Use await caller.call() instead."
+                "call_one_sync() cannot be called from an async context. "
+                "Use await caller.call_one() instead."
             )
         except RuntimeError as e:
             if "no running event loop" in str(e).lower():
-                return asyncio.run(self.call(messages, model, **kwargs))
+                return asyncio.run(self.call_one(messages, model, **kwargs))
             else:
                 raise
 
-    async def call_batch(
+    async def call(
         self,
-        requests: list[dict],
+        messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
+        model: str | None = None,
         max_parallel: int = 10,
+        **kwargs
     ) -> list[OpenaiResponse]:
         """
         Make multiple async API calls in parallel.
 
+        Two usage modes:
+        1. List of messages with shared parameters:
+           call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
+
+        2. List of request dicts with individual parameters:
+           call([
+               {"messages": "Hi", "model": "gpt-4", "max_tokens": 10},
+               {"messages": "Hello", "model": "claude", "max_tokens": 20}
+           ])
+
         Args:
-            requests: List of request dicts, each containing call() parameters
-                      e.g., [{"messages": ..., "model": ...}, ...]
+            messages: Either a list of message inputs OR a list of request dicts
+            model: Model name (required if using mode 1)
             max_parallel: Maximum number of parallel requests
+            **kwargs: Additional parameters to apply to all requests (mode 1 only)
 
         Returns:
             List of OpenaiResponse objects
         """
+        if not messages:
+            return []
+
+        # Determine which mode we're in
+        if isinstance(messages[0], dict):
+            # Mode 2: List of request dicts
+            requests = messages
+        else:
+            # Mode 1: List of messages with shared parameters
+            if model is None:
+                raise ValueError("model parameter is required when passing a list of messages")
+
+            requests = [
+                {"messages": msg, "model": model, **kwargs}
+                for msg in messages
+            ]
+
         responses = await Slist(requests).par_map_async(
-            func=lambda req: self.call(**req),
+            func=lambda req: self.call_one(**req),
             max_par=max_parallel,
             tqdm=True,
         )
