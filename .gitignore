@@ -1,3 +1,7 @@
+.cache/
+.claude/
+tests/
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -11,10 +15,3 @@ wheels/
 
 # Secrets
 .env
-
-# Claude
-.designer.md.swp
-designer.md
-.mcp.json
-.orchestra/
-.claude/

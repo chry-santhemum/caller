@@ -1,25 +1,19 @@
 """
 Caller: A Python library for LLM API calls with caching and rate limiting.
 
-Provides unified interface for multiple LLM providers with:
-- SQLite-based caching with chunk management
-- Per-model rate limiting
-- Support for OpenRouter and Anthropic APIs
+Main entry point: Caller class
+
+Example:
+    from caller import Caller
+
+    caller = Caller()
+    response = await caller.call("Hello!", model="anthropic/claude-3.5-sonnet")
+    print(response.first_response)
 """
 
 from caller.caller import (
     Caller,
-    OpenrouterCaller,
-    AnthropicCaller,
-    MultiClientCaller,
-    PooledCaller,
-    CallerConfig,
-    CacheByModel,
     OpenaiResponse,
-    get_universal_caller,
-    sample_from_model,
-    sample_across_models,
-    sample_from_model_parallel,
 )
 
 from caller.llm_types import (
@@ -27,52 +21,17 @@ from caller.llm_types import (
     ChatHistory,
     InferenceConfig,
     ToolArgs,
-    APIRequestCache,
 )
 
-from caller.cache import (
-    SQLiteCacheBackend,
-    CacheChunk,
-    ChunkedCacheManager,
-)
-
-from caller.rate_limiter import (
-    RateLimitConfig,
-    RateLimiter,
-    ModelRateLimitManager,
-    estimate_tokens,
-)
-
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
-    # Caller classes
+    # Main class
     "Caller",
-    "OpenrouterCaller",
-    "AnthropicCaller",
-    "MultiClientCaller",
-    "PooledCaller",
-    "CallerConfig",
-    "CacheByModel",
     "OpenaiResponse",
-    "get_universal_caller",
-    # Sampling functions
-    "sample_from_model",
-    "sample_across_models",
-    "sample_from_model_parallel",
-    # Types
+    # Types for advanced usage
     "ChatMessage",
     "ChatHistory",
     "InferenceConfig",
     "ToolArgs",
-    "APIRequestCache",
-    # Cache
-    "SQLiteCacheBackend",
-    "CacheChunk",
-    "ChunkedCacheManager",
-    # Rate limiting
-    "RateLimitConfig",
-    "RateLimiter",
-    "ModelRateLimitManager",
-    "estimate_tokens",
 ]

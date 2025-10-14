@@ -5,11 +5,7 @@ import logging
 import time
 from pathlib import Path
 
-# Add parent directory to path
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from rate_limiter import RateLimitConfig, RateLimiter, ModelRateLimitManager, estimate_tokens
+from caller.rate_limiter import RateLimitConfig, RateLimiter, ModelRateLimitManager, estimate_tokens
 
 
 async def test_rate_limiter():

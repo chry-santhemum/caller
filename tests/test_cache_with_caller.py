@@ -2,13 +2,35 @@
 import asyncio
 import time
 from pathlib import Path
-from llm_types import (
+from caller.llm_types import (
     APIRequestCache,
     ChatHistory,
     InferenceConfig,
     ToolArgs,
 )
-from caller import OpenaiResponse, CacheByModel
+from caller.caller import OpenaiResponse
+from caller.cache import SQLiteCacheBackend, ChunkedCacheManager
+
+
+class CacheByModel:
+    """Helper class to manage caches for multiple models (mimics internal behavior)."""
+    def __init__(self, cache_path: Path, cache_type=OpenaiResponse):
+        self.cache_path = Path(cache_path)
+        self.cache_path.mkdir(parents=True, exist_ok=True)
+        self.cache: dict[str, APIRequestCache] = {}
+        self.cache_type = cache_type
+
+    def get_cache(self, model: str) -> APIRequestCache:
+        if model not in self.cache:
+            path = self.cache_path / f"{model}.jsonl"
+            self.cache[model] = APIRequestCache(
+                cache_path=path, response_type=self.cache_type
+            )
+        return self.cache[model]
+
+    async def flush(self) -> None:
+        for cache in self.cache.values():
+            await cache.flush()
 
 
 async def test_cache_by_model():
@@ -32,19 +54,19 @@ async def test_cache_by_model():
 
     responses = [
         OpenaiResponse(
-            choices=[{"message": {"content": "Response from GPT-4", "role": "assistant"}}],
+            choices=[{"message": {"content": "Response from GPT-4", "role": "assistant"}, "finish_reason": "stop"}],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             created=int(time.time()),
             model="gpt-4"
         ),
         OpenaiResponse(
-            choices=[{"message": {"content": "Response from Claude", "role": "assistant"}}],
+            choices=[{"message": {"content": "Response from Claude", "role": "assistant"}, "finish_reason": "stop"}],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             created=int(time.time()),
             model="claude-sonnet"
         ),
         OpenaiResponse(
-            choices=[{"message": {"content": "Response from GPT-3.5", "role": "assistant"}}],
+            choices=[{"message": {"content": "Response from GPT-3.5", "role": "assistant"}, "finish_reason": "stop"}],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
             created=int(time.time()),
             model="gpt-3.5-turbo"
@@ -119,7 +141,7 @@ async def test_cache_by_model():
     # Test: Cache hit after adding entry
     print("\nTesting cache hit after new entry...")
     new_response = OpenaiResponse(
-        choices=[{"message": {"content": "New response", "role": "assistant"}}],
+        choices=[{"message": {"content": "New response", "role": "assistant"}, "finish_reason": "stop"}],
         usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         created=int(time.time()),
         model="gpt-4"

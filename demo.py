@@ -1,0 +1,135 @@
+"""
+Example usage of the Caller library.
+"""
+import asyncio
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from caller import Caller, ChatHistory
+
+
+@contextmanager
+def timer(description: str = "Operation"):
+    """Context manager to measure wallclock time."""
+    start = time.time()
+    yield
+    elapsed = time.time() - start
+    print(f"  [{description}] took {elapsed:.3f}s")
+
+
+async def basic_usage():
+    # Initialize the caller
+    caller = Caller(
+        cache_dir=".cache/caller",
+        dotenv_path=Path(".env")
+    )
+
+    # One message
+    response = await caller.call(
+        messages="What is the capital of France?",
+        model="anthropic/claude-3.5-haiku",
+        max_tokens=50,
+    )
+
+    print(f"Answer: {response.first_response}")
+    print(f"Tokens used: {response.usage}")
+
+
+    # Multiple messages
+    questions = [
+        "What is the capital of Japan?",
+        "What is the capital of Germany?",
+        "What is the capital of Brazil?",
+    ]
+
+    requests = [
+        {
+            "messages": question,
+            "model": "anthropic/claude-3.5-haiku",
+            "max_tokens": 30,
+        }
+        for question in questions
+    ]
+
+    print(f"Processing {len(requests)} questions in parallel...\n")
+
+    # Process in parallel
+    responses = await caller.call_batch(requests, max_parallel=3)
+
+    for question, response in zip(questions, responses):
+        print(f"Q: {question}")
+        print(f"A: {response.first_response}\n")
+
+
+    # Use as context manager
+    async with caller:
+        response = await caller.call(
+            messages="What is async/await?",
+            model="anthropic/claude-3.5-haiku",
+            max_tokens=100,
+        )
+        print(f"Response: {response.first_response}")
+        # Cache is automatically flushed on exit
+
+
+
+# Using different providers
+
+async def different_providers():
+    caller = Caller()
+
+    # Default: all models use OpenRouter
+    response = await caller.call(
+        messages="Say hello",
+        model="anthropic/claude-3.5-haiku",  # via OpenRouter
+        max_tokens=10,
+    )
+    print(f"   {response.first_response}")
+
+    # Explicitly use Anthropic Direct API
+    response = await caller.call(
+        messages="Say hello",
+        model="claude-sonnet-4-5-20250929",
+        provider="anthropic",  # Explicit override
+        max_tokens=10,
+    )
+    print(f"   {response.first_response}")
+
+    # Explicitly use OpenAI Direct API
+    response = await caller.call(
+        messages="Say hello",
+        model="gpt-5-mini",
+        provider="openai",  # Explicit override
+        max_tokens=10,
+    )
+    print(f"   {response.first_response}")
+
+
+# Response caching
+
+async def cache_demo():
+    caller = Caller()
+
+    message = "What is 2+2?"
+    model = "anthropic/claude-sonnet-4-5-20250929"
+
+    print("First call (hits API)...")
+    with timer("API call"):
+        response1 = await caller.call(message, model=model, max_tokens=10)
+    print(f"  Response: {response1.first_response}")
+
+    print("\nSecond call (hits cache)...")
+    with timer("Cache hit"):
+        response2 = await caller.call(message, model=model, max_tokens=10)
+    print(f"  Response: {response2.first_response}")
+    print(f"  Same as first? {response1.first_response == response2.first_response}")
+
+    print("\nThird call with different parameters (hits API)...")
+    with timer("API call"):
+        response3 = await caller.call(message, model=model, max_tokens=10, temperature=0.9)
+    print(f"  Response: {response3.first_response}")
+
+
+
+if __name__ == "__main__":
+    asyncio.run(basic_usage())

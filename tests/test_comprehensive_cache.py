@@ -2,11 +2,11 @@
 import asyncio
 import time
 from pathlib import Path
-from llm_types import (
+from caller.llm_types import (
     ChatHistory,
     InferenceConfig,
 )
-from caller import OpenaiResponse, CacheByModel
+from caller.caller import OpenaiResponse, CacheByModel
 
 
 async def test_comprehensive_cache_behavior():

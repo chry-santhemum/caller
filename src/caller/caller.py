@@ -1,73 +1,48 @@
-# %%
-"""API caller class."""
+"""
+Unified Caller class for LLM API calls with caching, rate limiting, and retry logic.
+"""
 import os
-import random
-import dotenv
-import logging
 import asyncio
-from json import JSONDecodeError
-from datetime import datetime
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Generic, Sequence, Type
-from pydantic import ValidationError
+from typing import Sequence, Literal
+from json import JSONDecodeError
 
+from dotenv import load_dotenv
+from pydantic import BaseModel, ValidationError
 from slist import Slist
 from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_random_exponential,
+    wait_exponential,
+    before_sleep_log,
 )
 
 import openai
 import anthropic
-from openai import AsyncOpenAI, BaseModel
-# from openai._types import NOT_GIVEN as OPENAI_NOT_GIVEN
+from openai import AsyncOpenAI
 from openai._types import omit as OPENAI_OMIT
 from anthropic import AsyncAnthropic
 from anthropic.types.message import Message
-# from anthropic._types import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
 from anthropic._types import omit as ANTHROPIC_OMIT
 
 from caller.llm_types import (
     APIRequestCache,
     ChatMessage,
-    GenericBaseModel,
+    ChatHistory,
     InferenceConfig,
     ToolArgs,
-    ChatHistory,
 )
+from caller.cache import SQLiteCacheBackend, ChunkedCacheManager
 
 
 logger = logging.getLogger(__name__)
 
 
-# Load config for cache-disabled models
-_NO_CACHE_MODELS: list[str] = []
-try:
-    import json
-    _config_path = Path("config.json")
-    if _config_path.exists():
-        with open(_config_path, "r") as f:
-            _config_data = json.load(f)
-            _NO_CACHE_MODELS = _config_data.get("no_cache_models", [])
-            if _NO_CACHE_MODELS:
-                logger.info(f"Loaded {len(_NO_CACHE_MODELS)} models with caching disabled")
-except Exception as e:
-    logger.warning(f"Could not load no_cache_models from config: {e}")
-
-
-def _is_cache_disabled_for_model(model: str) -> bool:
-    """Check if caching is disabled for this model."""
-    return model in _NO_CACHE_MODELS
-
-
 def is_thinking_model(model_name: str) -> bool:
-    """
-    Whether or not there is an explicit thinking mode for this model.
-    """
+    """Whether or not there is an explicit thinking mode for this model."""
     THINKING_MODELS = [
         "claude-opus-4-1-20250805",
         "claude-opus-4-20250514",
@@ -85,6 +60,7 @@ def is_thinking_model(model_name: str) -> bool:
 
 
 class OpenaiResponse(BaseModel):
+    """Unified response format for all providers."""
     choices: list[dict]
     usage: dict
     created: int
@@ -99,475 +75,209 @@ class OpenaiResponse(BaseModel):
             if content is None:
                 raise ValueError(f"No content found in OpenaiResponse: {self}")
             if isinstance(content, dict):
-                # anthropic format
                 content = content.get("text", "")
             return content
-        except TypeError:
-            raise ValueError(f"No content found in OpenaiResponse: {self}")
+        except (TypeError, KeyError, IndexError) as e:
+            raise ValueError(f"No content found in OpenaiResponse: {self}") from e
 
     @property
     def reasoning_content(self) -> str | None:
-        """
-        Returns the reasoning content if it exists, otherwise None.
-        """
-        # sometimes has reasoning_content or reasoning instead of content e.g. deepseek-reasoner or gemini
-        possible_keys = ["reasoning_content", "reasoning"]
-        for key in possible_keys:
-            if key in self.choices[0]["message"]:
-                return self.choices[0]["message"][key]
+        """Returns the reasoning content if it exists, otherwise None."""
+        try:
+            possible_keys = ["reasoning_content", "reasoning"]
+            for key in possible_keys:
+                if key in self.choices[0]["message"]:
+                    return self.choices[0]["message"][key]
 
-            content = self.choices[0]["message"].get("content")
-            if isinstance(content, dict) and key in content:
-                return content[key]
+                content = self.choices[0]["message"].get("content")
+                if isinstance(content, dict) and key in content:
+                    return content[key]
+        except (KeyError, IndexError):
+            pass
         return None
-        # raise ValueError(f"No reasoning_content found in OpenaiResponse: {self}")
 
     @property
     def has_reasoning(self) -> bool:
-        if self.reasoning_content is not None:
-            return True
-        return False
+        return self.reasoning_content is not None
 
     def has_response(self) -> bool:
         if len(self.choices) == 0:
             return False
         first_choice = self.choices[0]
-        if first_choice["message"] is None:
+        if first_choice.get("message") is None:
             return False
-        if first_choice["message"]["content"] is None:
+        if first_choice["message"].get("content") is None:
             return False
         return True
 
     @property
     def hit_content_filter(self) -> bool:
-        """
-        OpenaiResponse(choices=[{'finish_reason': None, 'index': 0, 'logprobs': None, 'message': None, 'finishReason': 'content_filter'}], usage={'completion_tokens': None, 'prompt_tokens': None, 'total_tokens': None, 'completion_tokens_details': None, 'prompt_tokens_details': None, 'completionTokens': 0, 'promptTokens': 279, 'totalTokens': 279}, created=1734802468, model='gemini-2.0-flash-exp', id=None, system_fingerprint=None, object='chat.completion', service_tier=None)
-        """
-        first_choice = self.choices[0]
-        if "finishReason" in first_choice:
-            if first_choice["finishReason"] == "content_filter":
-                return True
-        if "finish_reason" in first_choice:
-            if first_choice["finish_reason"] == "content_filter":
-                return True
-        return False
+        """Check if response was blocked by content filter."""
+        try:
+            first_choice = self.choices[0]
+            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
+            return finish_reason == "content_filter"
+        except (KeyError, IndexError):
+            return False
 
     @property
     def abnormal_finish(self) -> bool:
-        first_choice = self.choices[0]
-        if "finishReason" in first_choice:
-            if first_choice["finishReason"] not in ["stop", "length"]:
-                return True
-        if "finish_reason" in first_choice:
-            if first_choice["finish_reason"] not in ["stop", "length"]:
-                return True
-        return False
-
-
-class Caller(ABC):
-    @abstractmethod
-    async def call(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage],
-        config: InferenceConfig,
-        tool_args: ToolArgs | None = None,
-    ) -> OpenaiResponse:
-        pass
-
-    @abstractmethod
-    async def flush(self) -> None:
-        # flush file buffers
-        raise NotImplementedError()
-
-    ## implement context manager
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        await self.flush()
-
-
-class CacheByModel(Generic[GenericBaseModel]):
-    def __init__(
-        self, cache_path: Path, cache_type: Type[GenericBaseModel] = OpenaiResponse
-    ):
-        self.cache_path = Path(cache_path)
-        # if not exists, create it
-        if not self.cache_path.exists():
-            self.cache_path.mkdir(parents=True)
-        assert (
-            self.cache_path.is_dir()
-        ), f"cache_path must be a folder, you provided {cache_path}"
-        self.cache: dict[str, APIRequestCache[GenericBaseModel]] = {}
-        self.cache_type = cache_type
-
-    def get_cache(self, model: str) -> APIRequestCache[GenericBaseModel]:
-        if model not in self.cache:
-            path = self.cache_path / f"{model}.jsonl"
-            self.cache[model] = APIRequestCache(
-                cache_path=path, response_type=self.cache_type
-            )
-        return self.cache[model]
-
-    async def flush(self) -> None:
-        for cache in self.cache.values():
-            await cache.flush()
-
-
-class OpenrouterCaller(Caller):
-    def __init__(
-        self,
-        cache_path: Path | str | CacheByModel,
-        api_key: str | None = None,
-        client: AsyncOpenAI | None = None,
-    ):
-        if client is not None:
-            self.client = client
-        else:
-            if api_key is None:
-                env_key = os.getenv("OPENROUTER_API_KEY")
-                assert (
-                    env_key is not None
-                ), "Please provide an OpenRouter API Key. Either pass it as an argument or set it in the environment variable OPENROUTER_API_KEY"
-                api_key = env_key
-            self.client = AsyncOpenAI(api_key=api_key)
-        self.cache_by_model = (
-            CacheByModel(Path(cache_path))
-            if not isinstance(cache_path, CacheByModel)
-            else cache_path
-        )
-
-    async def flush(self) -> None:
-        await self.cache_by_model.flush()
-
-    def get_cache(self, model: str) -> APIRequestCache[OpenaiResponse]:
-        return self.cache_by_model.get_cache(model)
-
-    # UPDATE (Atticus): use new reasoning format for OpenRouter
-    async def call(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage],
-        config: InferenceConfig,
-        tool_args: ToolArgs | None = None,
-    ) -> OpenaiResponse:
-        if not isinstance(messages, ChatHistory):
-            messages = ChatHistory(messages=messages)
-        disable_cache = _is_cache_disabled_for_model(config.model)
-        if not disable_cache:
-            maybe_result = await self.get_cache(config.model).get_model_call(
-                messages, config, tool_args
-            )
-            if maybe_result is not None:
-                return maybe_result
-
-        if not is_thinking_model(config.model):
-            to_pass_reasoning = {}
-        elif config.reasoning is None:
-            to_pass_reasoning = {"reasoning": OPENAI_OMIT}
-        else:
-            config.reasoning.pop("max_tokens", None)
-            to_pass_reasoning = {"reasoning_effort": config.reasoning["effort"]}
-
-        to_pass_extra_body = config.extra_body
-        if config.model == "meta-llama/llama-3.1-8b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"]}
-            }
-        elif config.model == "meta-llama/llama-3.1-70b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["deepinfra/turbo", "fireworks"]}
-            }
-
-        if len(messages.messages) == 0:
-            raise ValueError("Messages must be non-empty")
+        """Check if response finished abnormally."""
         try:
-            logger.debug(f"Calling OpenRouter with config: {config}")
-            chat_completion = await self.client.chat.completions.create(
-                model=config.model,
-                messages=[msg.to_openai_content() for msg in messages.messages],  # type: ignore
-                max_tokens=(
-                    config.max_tokens
-                    if config.max_tokens is not None
-                    else OPENAI_OMIT
-                ),
-                temperature=(
-                    config.temperature
-                    if config.temperature is not None
-                    else OPENAI_OMIT
-                ),
-                top_p=config.top_p if config.top_p is not None else OPENAI_OMIT,
-                frequency_penalty=(
-                    config.frequency_penalty
-                    if config.frequency_penalty is not None
-                    else OPENAI_OMIT
-                ),
-                response_format=config.response_format if config.response_format is not None else OPENAI_OMIT,  # type: ignore
-                tools=tool_args.tools if tool_args is not None else OPENAI_OMIT,  # type: ignore
-                extra_body=to_pass_extra_body,
-                **to_pass_reasoning,  # type: ignore
-            )
+            first_choice = self.choices[0]
+            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
+            return finish_reason not in ["stop", "length", None]
+        except (KeyError, IndexError):
+            return False
+
+
+class RateLimitState(BaseModel):
+    """Rate limit state parsed from response headers."""
+    requests_remaining: int | None = None
+    requests_reset: datetime | None = None
+    tokens_remaining: int | None = None
+    tokens_reset: datetime | None = None
+    input_tokens_remaining: int | None = None
+    output_tokens_remaining: int | None = None
+
+
+class HeaderRateLimiter:
+    """
+    Rate limiter that uses response headers from APIs.
+    Only applies to Anthropic and OpenAI direct APIs.
+    OpenRouter has no rate limit headers, so we rely on retries.
+    """
+
+    def __init__(self):
+        self.states: dict[str, RateLimitState] = {}
+        self.locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, model: str) -> asyncio.Lock:
+        """Get or create lock for a model."""
+        if model not in self.locks:
+            self.locks[model] = asyncio.Lock()
+        return self.locks[model]
+
+    async def wait_if_needed(self, model: str, provider: str) -> None:
+        """
+        Check rate limits and wait if necessary.
+        Only applies to providers that return rate limit headers.
+        """
+        if provider == "openrouter":
+            return  # OpenRouter: no proactive limiting, rely on retries
+
+        lock = self._get_lock(model)
+        async with lock:
+            state = self.states.get(model)
+            if not state:
+                return
+
+            now = datetime.now()
+            if state.requests_reset and now >= state.requests_reset:
+                return
+
+            if state.requests_remaining is not None and state.requests_remaining < 5:
+                if state.requests_reset:
+                    wait_time = (state.requests_reset - now).total_seconds()
+                    if wait_time > 0:
+                        logger.warning(
+                            f"Rate limit low for {model} "
+                            f"({state.requests_remaining} requests remaining), "
+                            f"waiting {wait_time:.1f}s"
+                        )
+                        await asyncio.sleep(wait_time)
+                        return
+            if state.input_tokens_remaining is not None and state.input_tokens_remaining < 1000:
+                if state.tokens_reset:
+                    wait_time = (state.tokens_reset - now).total_seconds()
+                    if wait_time > 0:
+                        logger.warning(
+                            f"Token limit low for {model} "
+                            f"({state.input_tokens_remaining} input tokens remaining), "
+                            f"waiting {wait_time:.1f}s"
+                        )
+                        await asyncio.sleep(wait_time)
+
+    def update_from_headers(self, model: str, provider: str, headers: dict | None) -> None:
+        """Update rate limit state from response headers."""
+        if not headers or provider == "openrouter":
+            return
+
+        if provider == "anthropic":
+            self._parse_anthropic_headers(model, headers)
+        elif provider == "openai":
+            self._parse_openai_headers(model, headers)
+
+    def _parse_anthropic_headers(self, model: str, headers: dict) -> None:
+        """Parse Anthropic rate limit headers."""
+        try:
+            state = RateLimitState()
+
+            if "anthropic-ratelimit-requests-remaining" in headers:
+                state.requests_remaining = int(headers["anthropic-ratelimit-requests-remaining"])
+            if "anthropic-ratelimit-requests-reset" in headers:
+                state.requests_reset = datetime.fromisoformat(
+                    headers["anthropic-ratelimit-requests-reset"].replace("Z", "+00:00")
+                )
+
+            if "anthropic-ratelimit-input-tokens-remaining" in headers:
+                state.input_tokens_remaining = int(headers["anthropic-ratelimit-input-tokens-remaining"])
+
+            if "anthropic-ratelimit-output-tokens-remaining" in headers:
+                state.output_tokens_remaining = int(headers["anthropic-ratelimit-output-tokens-remaining"])
+
+            if "anthropic-ratelimit-tokens-reset" in headers:
+                state.tokens_reset = datetime.fromisoformat(
+                    headers["anthropic-ratelimit-tokens-reset"].replace("Z", "+00:00")
+                )
+
+            self.states[model] = state
+            logger.debug(f"Updated rate limits for {model}: {state}")
         except Exception as e:
-            note = f"Model: {config.model}. API domain: {self.client.base_url}"
-            e.add_note(note)
-            raise e
+            logger.warning(f"Failed to parse Anthropic headers: {e}")
 
+    def _parse_openai_headers(self, model: str, headers: dict) -> None:
+        """Parse OpenAI rate limit headers."""
         try:
-            resp = OpenaiResponse.model_validate(chat_completion.model_dump())
-        except ValidationError as e:
-            logger.error(
-                f"Validation error for model {config.model}.\n"
-                f"Prompt: {messages}.\n"
-                f"resp: {chat_completion.model_dump()}\n"
-            )
-            logger.error(f"Full traceback:", exc_info=True)
-            raise e
+            state = RateLimitState()
 
-        logger.debug(f"OpenRouter response: {resp}")
+            if "x-ratelimit-remaining-requests" in headers:
+                state.requests_remaining = int(headers["x-ratelimit-remaining-requests"])
+            if "x-ratelimit-reset-requests" in headers:
+                reset_str = headers["x-ratelimit-reset-requests"]
+                state.requests_reset = self._parse_reset_time(reset_str)
 
-        # Only cache clean, usable responses
-        if (
-            not disable_cache
-            and resp.has_response()
-            and not resp.abnormal_finish
-            and not resp.hit_content_filter
-        ):
-            await self.get_cache(config.model).add_model_call(
-                messages=messages,
-                config=config,
-                response=resp,
-                tools=tool_args,
-            )
-        return resp
+            if "x-ratelimit-remaining-tokens" in headers:
+                state.tokens_remaining = int(headers["x-ratelimit-remaining-tokens"])
+            if "x-ratelimit-reset-tokens" in headers:
+                reset_str = headers["x-ratelimit-reset-tokens"]
+                state.tokens_reset = self._parse_reset_time(reset_str)
 
+            self.states[model] = state
+            logger.debug(f"Updated rate limits for {model}: {state}")
+        except Exception as e:
+            logger.warning(f"Failed to parse OpenAI headers: {e}")
 
-class AnthropicCaller(Caller):
-    def __init__(
-        self,
-        anthropic_client: anthropic.AsyncAnthropic,
-        cache_path: Path | str | CacheByModel,
-    ):
-        self.client = anthropic_client
-        self.cache_by_model = (
-            CacheByModel(Path(cache_path))
-            if not isinstance(cache_path, CacheByModel)
-            else cache_path
-        )
+    def _parse_reset_time(self, reset_str: str) -> datetime:
+        """Parse reset time string like '7m12s' into datetime."""
+        import re
 
-    async def flush(self) -> None:
-        await self.cache_by_model.flush()
+        total_seconds = 0
 
-    def get_cache(self, model: str) -> APIRequestCache[OpenaiResponse]:
-        return self.cache_by_model.get_cache(model)
+        m_match = re.search(r'(\d+)m', reset_str)
+        if m_match:
+            total_seconds += int(m_match.group(1)) * 60
 
-    async def call(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage],
-        config: InferenceConfig,
-        tool_args: ToolArgs | None = None,
-    ) -> OpenaiResponse:
-        if not isinstance(messages, ChatHistory):
-            messages = ChatHistory(messages=messages)
-        assert tool_args is None, "Anthropic does not support tools"
-        disable_cache = _is_cache_disabled_for_model(config.model)
-        if not disable_cache:
-            maybe_result = await self.get_cache(config.model).get_model_call(
-                messages, config, tool_args
-            )
-            if maybe_result is not None:
-                return maybe_result
+        # Don't match milliseconds here
+        s_match = re.search(r'(\d+)s(?!$)', reset_str)
+        if s_match:
+            total_seconds += int(s_match.group(1))
 
-        non_system, system = Slist(messages.messages).split_by(
-            lambda msg: msg.role != "system"
-        )
-        anthropic_messages = [
-            {"role": msg.role, "content": msg.content} for msg in non_system
-        ]
-        if system.length >= 2:
-            raise ValueError("Anthropic does not support multiple system messages")
-        system_message: ChatMessage | None = system.first_option
-        to_pass_sys = (
-            system_message.content
-            if system_message is not None
-            else ANTHROPIC_OMIT
-        )
+        ms_match = re.search(r'(\d+)ms', reset_str)
+        if ms_match:
+            total_seconds += int(ms_match.group(1)) / 1000
 
-        if config.reasoning is not None and is_thinking_model(config.model):
-            to_pass_thinking = {
-                "type": "enabled",
-                "budget_tokens": config.reasoning["max_tokens"],
-            }
-            to_pass_temperature = 1.0
-        else:
-            to_pass_thinking = ANTHROPIC_OMIT
-            to_pass_temperature = (
-                config.temperature
-                if config.temperature is not None
-                else ANTHROPIC_OMIT
-            )
-
-        assert config.max_tokens is not None, "Anthropic requires max_tokens"
-
-        logger.debug(f"Calling Anthropic with config: {config}")
-        response: Message = await self.client.messages.create(
-            model=config.model,
-            messages=anthropic_messages,  # type: ignore
-            max_tokens=config.max_tokens,  # type: ignore
-            temperature=to_pass_temperature,  # type: ignore
-            top_p=config.top_p if config.top_p is not None else ANTHROPIC_OMIT,  # type: ignore
-            system=to_pass_sys,
-            thinking=to_pass_thinking,  # type: ignore
-            extra_body=config.extra_body,
-        )
-
-        # convert
-        # response.content is a list of blocks: ThinkingBlock, TextBlock
-        # TODO: add ToolUse support
-        if response.content[0].type == "thinking":
-            if len(response.content) != 2:
-                logger.warning(f"Expected 2 blocks in response: {response.content}")
-
-            try:
-                response_content = {
-                    "reasoning": response.content[0].thinking,
-                    "text": response.content[1].text,
-                }
-            except Exception as e:
-                response_content = {
-                    "reasoning": "N/A",
-                    "text": "N/A",
-                }
-        else:
-            if len(response.content) != 1:
-                logger.warning(f"Expected 1 block in response: {response.content}")
-            try:
-                response_content = {
-                    "text": response.content[0].text,
-                }
-            except Exception as e:
-                response_content = {
-                    "text": "N/A",
-                }
-
-        openai_response = OpenaiResponse(
-            id=response.id,
-            choices=[{"message": {"content": response_content, "role": "assistant"}}],
-            created=int(datetime.now().timestamp()),
-            model=config.model,
-            system_fingerprint=None,
-            usage=response.usage.model_dump(),
-        )
-
-        # Only cache clean, usable responses
-        if (
-            not disable_cache
-            and openai_response.has_response()
-            and not openai_response.abnormal_finish
-            and not openai_response.hit_content_filter
-        ):
-            await self.get_cache(config.model).add_model_call(
-                messages=messages,
-                config=config,
-                response=openai_response,
-                tools=tool_args,
-            )
-
-        return openai_response
-
-
-@dataclass
-class CallerConfig:
-    prefix: str
-    caller: Caller
-
-
-class MultiClientCaller(Caller):
-    """
-    Routes requests to the appropriate caller based on the model name.
-    """
-
-    def __init__(self, clients: Sequence[CallerConfig]):
-        self.callers: list[tuple[str, Caller]] = [
-            (client.prefix, client.caller) for client in clients
-        ]
-
-    async def flush(self) -> None:
-        for _, caller in self.callers:
-            await caller.flush()
-
-    def _get_caller_for_model(self, model: str) -> Caller:
-        for model_prefix, caller in self.callers:
-            if model.startswith(model_prefix):
-                return caller
-        available_patterns = [pattern for pattern, _ in self.callers]
-        raise ValueError(
-            f"No caller found for model {model}. Available patterns specified: {available_patterns}"
-        )
-
-    async def call(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage],
-        config: InferenceConfig,
-        tool_args: ToolArgs | None = None,
-    ) -> OpenaiResponse:
-        caller = self._get_caller_for_model(config.model)
-        return await caller.call(messages, config, tool_args)
-
-
-class PooledCaller(Caller):
-    def __init__(self, callers: Sequence[Caller]):
-        self.callers = callers
-
-    async def flush(self) -> None:
-        for caller in self.callers:
-            await caller.flush()
-
-    async def call(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage],
-        config: InferenceConfig,
-        tool_args: ToolArgs | None = None,
-    ) -> OpenaiResponse:
-        caller = random.choice(self.callers)
-        return await caller.call(messages, config, tool_args)
-
-
-def get_universal_caller(
-    cache_dir: str = "/workspace/rm-bias/.api_cache",
-    dotenv_path: str = "/workspace/rm-bias/.env",
-) -> MultiClientCaller:
-    dotenv.load_dotenv(dotenv_path=dotenv_path)
-    if not (openrouter_key := os.getenv("OPENROUTER_API_KEY")):
-        logger.warning("OPENROUTER_API_KEY not found in environment.")
-    if not (anthropic_key := os.getenv("ANTHROPIC_API_KEY")):
-        logger.warning("ANTHROPIC_API_KEY not found in environment.")
-
-    # Create cache directory structure
-    cache_path = Path(cache_dir)
-    cache_by_model = CacheByModel(cache_path)
-
-    # Configure callers
-    callers = []
-    openrouter_client = AsyncOpenAI(
-        api_key=openrouter_key, base_url="https://openrouter.ai/api/v1"
-    )
-    openrouter_caller = OpenrouterCaller(
-        client=openrouter_client, cache_path=cache_by_model
-    )
-    anthropic_client = AsyncAnthropic(api_key=anthropic_key)
-    anthropic_caller = AnthropicCaller(
-        anthropic_client=anthropic_client, cache_path=cache_by_model
-    )
-
-    callers.extend(
-        [
-            CallerConfig(prefix="claude-", caller=anthropic_caller),
-            CallerConfig(
-                prefix="", caller=openrouter_caller
-            ),  # use openrouter for all other models
-        ]
-    )
-
-    return MultiClientCaller(clients=callers)
+        return datetime.now() + timedelta(seconds=total_seconds)
 
 
 RETRYABLE_EXCEPTIONS = (
@@ -584,158 +294,469 @@ CHANCE_EXCEPTIONS = (
     ValidationError,
     JSONDecodeError,
     ValueError,
-    anthropic.BadRequestError,
 )
 
 
-def custom_wait_strategy(retry_state):
-    """Custom wait strategy based on exception type."""
-    exception = retry_state.outcome.exception()
-
-    print(
-        f"Retry attempt {retry_state.attempt_number}: Exception type: {type(exception)}, Exception: {exception}"
-    )
-
-    # Rate limit and timeout errors: use exponential backoff
-    if isinstance(exception, RETRYABLE_EXCEPTIONS):
-        print(f"Retryable exception: {exception}")
-        return wait_random_exponential(multiplier=5, max=60)(retry_state)
-
-    # Validation and server errors: use fixed wait
-    elif isinstance(exception, CHANCE_EXCEPTIONS):
-        print(f"Chance exception: {exception}")
-        return 0.5
-
-    print(f"Unhandled exception type: {type(exception)}")
-    return 0.0
-
-
-@retry(
-    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS + CHANCE_EXCEPTIONS),
-    wait=custom_wait_strategy,
-    stop=stop_after_attempt(5),
-)
-async def sample_from_model(
-    prompt: ChatHistory, caller: MultiClientCaller, full_logging: bool = False, **kwargs
-) -> OpenaiResponse:
+class Caller:
     """
-    Run a single prompt and return the model's response with retry logic.
-    kwargs are passed to InferenceConfig.
+    Unified LLM API caller with caching, rate limiting, and retry logic.
+
+    Usage:
+        caller = Caller()
+        response = await caller.call(messages, model="anthropic/claude-3.5-sonnet")
+
+        # Or synchronously
+        response = caller.call_sync(messages, model="gpt-4")
     """
-    if full_logging:
-        logger.info(
-            f"Sampling from model {kwargs['model']}. <PROMPT> {prompt.as_text()} </PROMPT>"
+
+    def __init__(
+        self,
+        cache_dir: str = ".cache/caller",
+        default_provider: str = "openrouter",
+        openrouter_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
+        openai_api_key: str | None = None,
+        dotenv_path: str | Path | None = None,
+    ):
+        """
+        Initialize Caller with API clients and caching.
+
+        Args:
+            cache_dir: Directory for SQLite cache
+            default_provider: Default provider to use (always "openrouter" by default)
+            openrouter_api_key: OpenRouter API key (or set OPENROUTER_API_KEY env var)
+            anthropic_api_key: Anthropic API key (or set ANTHROPIC_API_KEY env var)
+            openai_api_key: OpenAI API key (or set OPENAI_API_KEY env var)
+            dotenv_path: Path to .env file (optional)
+        """
+        if dotenv_path:
+            load_dotenv(dotenv_path=dotenv_path)
+        else:
+            load_dotenv()
+
+        self.openrouter_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.anthropic_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+
+        self.openrouter_client = AsyncOpenAI(
+            api_key=self.openrouter_key,
+            base_url="https://openrouter.ai/api/v1"
+        ) if self.openrouter_key else None
+
+        self.anthropic_client = AsyncAnthropic(
+            api_key=self.anthropic_key
+        ) if self.anthropic_key else None
+
+        self.openai_client = AsyncOpenAI(
+            api_key=self.openai_key
+        ) if self.openai_key else None
+
+        self.default_provider = default_provider
+
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        db_path = self.cache_dir / "cache.db"
+        self.cache_backend = SQLiteCacheBackend(str(db_path))
+        self.cache_manager = ChunkedCacheManager(self.cache_backend)
+        self._cache_initialized = False
+        self.model_caches: dict[str, APIRequestCache] = {}
+
+        self.rate_limiter = HeaderRateLimiter()
+
+    async def _ensure_cache_initialized(self):
+        """Ensure cache backend is initialized."""
+        if not self._cache_initialized:
+            await self.cache_backend.initialize()
+            self._cache_initialized = True
+
+    def _get_cache(self, model: str) -> APIRequestCache:
+        """Get or create cache for a model."""
+        if model not in self.model_caches:
+            cache_path = self.cache_dir / f"{model}.jsonl"
+            self.model_caches[model] = APIRequestCache(
+                cache_path=cache_path,
+                response_type=OpenaiResponse
+            )
+        return self.model_caches[model]
+
+    def _get_provider(self, model: str, provider_override: str | None = None) -> str:
+        """
+        Determine which provider to use.
+        Default: always openrouter (as specified by user).
+        """
+        if provider_override:
+            return provider_override
+        return self.default_provider
+
+    async def call(
+        self,
+        messages: ChatHistory | Sequence[ChatMessage] | str,
+        model: str,
+        provider: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        response_format: dict | None = None,
+        reasoning: dict | None = None,
+        extra_body: dict | None = None,
+        tool_args: ToolArgs | None = None,
+        disable_cache: bool = False,
+    ) -> OpenaiResponse:
+        """
+        Make a single async API call.
+
+        Args:
+            messages: Chat messages (ChatHistory, list of ChatMessage, or single string)
+            model: Model name (e.g., "anthropic/claude-3.5-sonnet", "gpt-4")
+            provider: Override provider ("openrouter", "anthropic", "openai")
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            top_p: Nucleus sampling parameter
+            frequency_penalty: Frequency penalty
+            presence_penalty: Presence penalty
+            response_format: Response format specification
+            reasoning: Reasoning configuration for thinking models
+            extra_body: Extra parameters for the API
+            tool_args: Tool/function calling arguments
+            disable_cache: Skip cache lookup and storage
+
+        Returns:
+            OpenaiResponse with the model's response
+        """
+        if isinstance(messages, str):
+            messages = ChatHistory.from_user(messages)
+        elif not isinstance(messages, ChatHistory):
+            messages = ChatHistory(messages=messages)
+
+        config = InferenceConfig(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            response_format=response_format,
+            reasoning=reasoning,
+            extra_body=extra_body,
         )
 
-    response = await caller.call(
-        prompt,
-        config=InferenceConfig(**kwargs),
-    )
+        provider_to_use = self._get_provider(model, provider)
 
-    if full_logging:
-        print(response)
-        reasoning_content = response.reasoning_content
-        logger.info(
-            f"[sample_from_model] Got response:\n"
-            f"<RESPONSE> {response.first_response} </RESPONSE>\n"
-            f"<REASONING> {reasoning_content} </REASONING>"
+        if not disable_cache:
+            await self._ensure_cache_initialized()
+            cache = self._get_cache(model)
+            cached_response = await cache.get_model_call(messages, config, tool_args)
+            if cached_response:
+                logger.debug(f"Cache hit for model {model}")
+                return cached_response
+
+        await self.rate_limiter.wait_if_needed(model, provider_to_use)
+
+        response = await self._call_with_retry(
+            messages, config, provider_to_use, tool_args
         )
 
-    if response.abnormal_finish:
-        raise ValueError(f"Abnormal finish: {response}")
-    return response
+        if not disable_cache and response.has_response() and not response.abnormal_finish:
+            cache = self._get_cache(model)
+            await cache.add_model_call(messages, config, response, tool_args)
 
+        return response
 
-async def sample_across_models(
-    models: list[str],
-    prompt: ChatHistory,
-    caller: MultiClientCaller,
-    full_logging: bool = False,
-    desc: str = "",
-    **kwargs,
-) -> Slist[OpenaiResponse]:
-    """
-    Run the same prompt across multiple models.
-    """
-    responses = await Slist(models).par_map_async(
-        func=lambda model: sample_from_model(
-            prompt, caller, full_logging=full_logging, model=model, **kwargs
-        ),
-        max_par=len(models),
-        tqdm=True,
-        desc=desc,  # type: ignore
+    @retry(
+        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        wait=wait_exponential(multiplier=2, min=1, max=60),
+        stop=stop_after_attempt(8),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
     )
-    return responses
+    async def _call_with_retry(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        provider: str,
+        tool_args: ToolArgs | None,
+    ) -> OpenaiResponse:
+        """
+        Make API call with automatic retry on transient errors.
+        Decorated with @retry for exponential backoff.
+        """
+        if provider == "openrouter":
+            return await self._call_openrouter(messages, config, tool_args)
+        elif provider == "anthropic":
+            return await self._call_anthropic(messages, config, tool_args)
+        elif provider == "openai":
+            return await self._call_openai(messages, config, tool_args)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
 
+    async def _call_openrouter(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        tool_args: ToolArgs | None,
+    ) -> OpenaiResponse:
+        """Call OpenRouter API."""
+        if not self.openrouter_client:
+            raise ValueError("OpenRouter API key not provided")
 
-async def sample_from_model_parallel(
-    prompts: list[ChatHistory],
-    caller: MultiClientCaller,
-    max_par: int | None,
-    full_logging: bool = False,
-    desc: str = "",
-    **kwargs,
-) -> Slist[OpenaiResponse]:
-    """
-    Run multiple prompts across the same other kwargs.
-    """
-    logger.info(f"Sending {len(prompts)} prompts with {max_par} parallel calls...")
+        # Handle thinking models
+        if is_thinking_model(config.model):
+            if config.reasoning is None:
+                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
+            else:
+                config.reasoning.pop("max_tokens", None)
+                to_pass_reasoning = {"reasoning_effort": config.reasoning.get("effort")}
+        else:
+            to_pass_reasoning = {}
 
-    if desc == "":
-        to_pass_tqdm = False
-    else:
-        to_pass_tqdm = True
+        # Provider-specific routing
+        to_pass_extra_body = config.extra_body or {}
+        if config.model == "meta-llama/llama-3.1-8b-instruct":
+            to_pass_extra_body = {
+                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"]}
+            }
+        elif config.model == "meta-llama/llama-3.1-70b-instruct":
+            to_pass_extra_body = {
+                "provider": {"order": ["deepinfra/turbo", "fireworks"]}
+            }
 
-    responses = await Slist(prompts).par_map_async(
-        func=lambda prompt: sample_from_model(
-            prompt, caller, full_logging=full_logging, **kwargs
-        ),
-        max_par=max_par,
-        tqdm=to_pass_tqdm,
-        desc=desc,  # type: ignore
-    )
-    return responses
+        logger.debug(f"Calling OpenRouter with model: {config.model}")
 
+        create_kwargs = {
+            "model": config.model,
+            "messages": [msg.to_openai_content() for msg in messages.messages],
+        }
 
-# %%
-if __name__ == "__main__":
-    # demo code
-    import asyncio
+        if config.max_tokens is not None:
+            create_kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None:
+            create_kwargs["temperature"] = config.temperature
+        if config.top_p is not None:
+            create_kwargs["top_p"] = config.top_p
+        if config.frequency_penalty:
+            create_kwargs["frequency_penalty"] = config.frequency_penalty
+        if config.response_format is not None:
+            create_kwargs["response_format"] = config.response_format
+        if tool_args is not None:
+            create_kwargs["tools"] = tool_args.tools
+        if to_pass_extra_body:
+            create_kwargs["extra_body"] = to_pass_extra_body
+        if to_pass_reasoning:
+            create_kwargs.update(to_pass_reasoning)
 
-    # CHANGE THIS TO YOUR LOCATIONS
-    dotenv_path = Path("/workspace/rm-bias/.env")
-    if not dotenv_path.exists():
-        raise FileNotFoundError(f"Required .env file not found at {dotenv_path}")
-    cache_dir = "/workspace/rm-bias/.api_cache"
-    caller = get_universal_caller(cache_dir=cache_dir, dotenv_path=str(dotenv_path))
+        try:
+            chat_completion = await self.openrouter_client.chat.completions.create(**create_kwargs)
+        except Exception as e:
+            note = f"Model: {config.model}. Provider: openrouter"
+            e.add_note(note)
+            raise
 
-    prompt = ChatHistory.from_system(
-        "You are Neel Nanda, the mechanistic interpretability researcher."
-    )
-    prompt = prompt.add_user("What are the worst papers in interpretability?")
+        response = OpenaiResponse.model_validate(chat_completion.model_dump())
 
-    models = [
-        "claude-sonnet-4-20250514",
-        "claude-3-5-haiku-20241022",
-        "meta-llama/llama-3.1-8b-instruct",
-        "meta-llama/llama-3.3-70b-instruct",
-        "openai/gpt-5-mini",
-        "openai/o3",
-        "google/gemini-2.5-pro",
-    ]
-    response = asyncio.run(
-        sample_across_models(
-            models=models,
-            prompt=prompt,
-            caller=caller,
-            full_logging=True,
-            temperature=0.7,
-            max_tokens=1200,
-            reasoning={
-                "max_tokens": 1024,
-                "effort": "high",
-            },
+        # OpenRouter doesn't have rate limit headers, so no update needed
+
+        return response
+
+    async def _call_anthropic(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        tool_args: ToolArgs | None,
+    ) -> OpenaiResponse:
+        """Call Anthropic API directly."""
+        if not self.anthropic_client:
+            raise ValueError("Anthropic API key not provided")
+
+        # Separate system messages
+        non_system = [msg for msg in messages.messages if msg.role != "system"]
+        system_msgs = [msg for msg in messages.messages if msg.role == "system"]
+
+        if len(system_msgs) > 1:
+            raise ValueError("Anthropic does not support multiple system messages")
+
+        system_content = system_msgs[0].content if system_msgs else ANTHROPIC_OMIT
+
+        anthropic_messages = [
+            {"role": msg.role, "content": msg.content} for msg in non_system
+        ]
+
+        # Handle thinking models
+        if config.reasoning is not None and is_thinking_model(config.model):
+            to_pass_thinking = {
+                "type": "enabled",
+                "budget_tokens": config.reasoning["max_tokens"],
+            }
+            to_pass_temperature = 1.0
+        else:
+            to_pass_thinking = ANTHROPIC_OMIT
+            to_pass_temperature = config.temperature if config.temperature is not None else ANTHROPIC_OMIT
+
+        if config.max_tokens is None:
+            raise ValueError("Anthropic requires max_tokens")
+
+        logger.debug(f"Calling Anthropic with model: {config.model}")
+
+        create_kwargs = {
+            "model": config.model,
+            "messages": anthropic_messages,
+            "max_tokens": config.max_tokens,
+        }
+
+        if system_content != ANTHROPIC_OMIT:
+            create_kwargs["system"] = system_content
+        if to_pass_temperature != ANTHROPIC_OMIT:
+            create_kwargs["temperature"] = to_pass_temperature
+        if config.top_p is not None:
+            create_kwargs["top_p"] = config.top_p
+        if to_pass_thinking != ANTHROPIC_OMIT:
+            create_kwargs["thinking"] = to_pass_thinking
+        if config.extra_body:
+            create_kwargs["extra_body"] = config.extra_body
+
+        raw_response: Message = await self.anthropic_client.messages.create(**create_kwargs)
+
+        # Note: The anthropic SDK doesn't expose headers directly on the response object
+        # We'd need to use httpx directly to get headers, which we'll skip for now
+        # self.rate_limiter.update_from_headers(config.model, "anthropic", headers)
+
+        if raw_response.content[0].type == "thinking":
+            if len(raw_response.content) >= 2:
+                response_content = {
+                    "reasoning": raw_response.content[0].thinking,
+                    "text": raw_response.content[1].text,
+                }
+            else:
+                response_content = {
+                    "reasoning": raw_response.content[0].thinking,
+                    "text": "",
+                }
+        else:
+            response_content = {
+                "text": raw_response.content[0].text,
+            }
+
+        response = OpenaiResponse(
+            id=raw_response.id,
+            choices=[{"message": {"content": response_content, "role": "assistant"}, "finish_reason": "stop"}],
+            created=int(datetime.now().timestamp()),
+            model=config.model,
+            system_fingerprint=None,
+            usage=raw_response.usage.model_dump(),
         )
-    )
-    print(response.map(lambda x: x.first_response))
-# %%
+
+        return response
+
+    async def _call_openai(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        tool_args: ToolArgs | None,
+    ) -> OpenaiResponse:
+        """Call OpenAI API directly."""
+        if not self.openai_client:
+            raise ValueError("OpenAI API key not provided")
+
+        # Handle thinking models
+        if is_thinking_model(config.model):
+            if config.reasoning is None:
+                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
+            else:
+                config.reasoning.pop("max_tokens", None)
+                to_pass_reasoning = {"reasoning_effort": config.reasoning.get("effort")}
+        else:
+            to_pass_reasoning = {}
+
+        logger.debug(f"Calling OpenAI with model: {config.model}")
+
+        create_kwargs = {
+            "model": config.model,
+            "messages": [msg.to_openai_content() for msg in messages.messages],
+        }
+
+        if config.max_tokens is not None:
+            create_kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None:
+            create_kwargs["temperature"] = config.temperature
+        if config.top_p is not None:
+            create_kwargs["top_p"] = config.top_p
+        if config.frequency_penalty:
+            create_kwargs["frequency_penalty"] = config.frequency_penalty
+        if config.response_format is not None:
+            create_kwargs["response_format"] = config.response_format
+        if tool_args is not None:
+            create_kwargs["tools"] = tool_args.tools
+        if to_pass_reasoning:
+            create_kwargs.update(to_pass_reasoning)
+
+        chat_completion = await self.openai_client.chat.completions.create(**create_kwargs)
+
+        response = OpenaiResponse.model_validate(chat_completion.model_dump())
+
+        # Note: Similar to Anthropic, we'd need httpx to get headers
+        # self.rate_limiter.update_from_headers(config.model, "openai", headers)
+
+        return response
+
+    def call_sync(
+        self,
+        messages: ChatHistory | Sequence[ChatMessage] | str,
+        model: str,
+        **kwargs
+    ) -> OpenaiResponse:
+        """
+        Synchronous wrapper around async call().
+
+        Args:
+            Same as call()
+
+        Returns:
+            OpenaiResponse
+        """
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError(
+                "call_sync() cannot be called from an async context. "
+                "Use await caller.call() instead."
+            )
+        except RuntimeError as e:
+            if "no running event loop" in str(e).lower():
+                return asyncio.run(self.call(messages, model, **kwargs))
+            else:
+                raise
+
+    async def call_batch(
+        self,
+        requests: list[dict],
+        max_parallel: int = 10,
+    ) -> list[OpenaiResponse]:
+        """
+        Make multiple async API calls in parallel.
+
+        Args:
+            requests: List of request dicts, each containing call() parameters
+                      e.g., [{"messages": ..., "model": ...}, ...]
+            max_parallel: Maximum number of parallel requests
+
+        Returns:
+            List of OpenaiResponse objects
+        """
+        responses = await Slist(requests).par_map_async(
+            func=lambda req: self.call(**req),
+            max_par=max_parallel,
+            tqdm=True,
+        )
+        return list(responses)
+
+    async def flush(self):
+        """Flush cache to disk. SQLite commits immediately, so this is mostly a no-op."""
+        pass
+
+    async def __aenter__(self):
+        """Context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        """Context manager exit."""
+        await self.flush()
