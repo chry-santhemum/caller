@@ -1,16 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "llm-caller"
+name = "caller"
 version = "0.1.0"
-description = "Add your description here"
+description = "A Python library for LLM API calls with caching and rate limiting"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["llm", "api", "cache", "rate-limiting", "openai", "anthropic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
 dependencies = [
+    "aiosqlite>=0.20.0",
     "anthropic>=0.69.0",
-    "dotenv>=0.9.9",
     "openai>=2.3.0",
     "pydantic>=2.12.0",
     "python-dotenv>=1.1.1",
-    "requests>=2.32.5",
     "slist>=0.3.15",
     "tenacity>=9.1.2",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/caller"
+Repository = "https://github.com/yourusername/caller"
+Documentation = "https://github.com/yourusername/caller#readme"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -1,14 +1,13 @@
 """LLM types module."""
 
 import time
-import anyio
 import json
 import hashlib
-from anyio import Path as AnyioPath
 from slist import Slist
 from pathlib import Path
 from typing import Optional, Type, Sequence, Generic, TypeVar, Mapping, Any, Literal
 from pydantic import BaseModel, ValidationError
+from caller.cache import SQLiteCacheBackend, ChunkedCacheManager
 
 # Generic to say what we are caching
 APIResponse = TypeVar("APIResponse", bound=BaseModel)
@@ -167,29 +166,6 @@ class InferenceResponse(BaseModel):
             return self.raw_responses[0]
 
 
-class FileCacheRow(BaseModel):
-    key: str
-    response: str  # Should be generic, but w/e
-
-
-def write_jsonl_file_from_basemodel(
-    path: Path | str, basemodels: Sequence[BaseModel]
-) -> None:
-    if isinstance(path, str):
-        path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        for basemodel in basemodels:
-            f.write(basemodel.model_dump_json() + "\n")
-
-
-def read_jsonl_file_into_basemodel(
-    path: Path | str, basemodel: Type[APIResponse]
-) -> Slist[APIResponse]:
-    with open(path) as f:
-        return Slist(basemodel.model_validate_json(line) for line in f)
-
-
 def file_cache_key(
     messages: ChatHistory,
     config: InferenceConfig,
@@ -218,67 +194,32 @@ def file_cache_key(
 GenericBaseModel = TypeVar("GenericBaseModel", bound=BaseModel)
 
 
-def validate_json_item(
-    item: str, model: Type[GenericBaseModel]
-) -> GenericBaseModel | None:
-    try:
-        return model.model_validate_json(item)
-    except ValidationError:
-        print(f"Error validating {item} with model {model}")
-        return None
-
-
-async def read_jsonl_file_into_basemodel_async(
-    path: AnyioPath, basemodel: Type[GenericBaseModel]
-) -> Slist[GenericBaseModel]:
-    async with await anyio.open_file(path, "r") as f:
-        return Slist(
-            [basemodel.model_validate_json(line) for line in await f.readlines()]
-        )
-
-
 class APIRequestCache(Generic[APIResponse]):
     def __init__(self, cache_path: Path | str, response_type: Type[APIResponse]):
-        self.cache_path = AnyioPath(cache_path)
+        # Convert model-specific .jsonl path to shared .db path
+        # e.g., ".api_cache/gpt-4.jsonl" -> ".api_cache/cache.db"
+        cache_dir = Path(cache_path).parent
+        db_path = cache_dir / "cache.db"
+
+        # Extract model name from path (e.g., "gpt-4.jsonl" -> "gpt-4")
+        self.model_name = Path(cache_path).stem
         self.response_type = response_type
-        self.data: dict[str, str] = {}
-        self.file_handler: anyio.AsyncFile | None = None
-        self.loaded_cache: bool = False
-        self.cache_check_semaphore = anyio.Semaphore(1)
+
+        # Initialize SQLite backend
+        self.backend = SQLiteCacheBackend(str(db_path))
+        self.manager = ChunkedCacheManager(self.backend)
+
+        # Initialize DB (async, called in get_model_call if needed)
+        self._initialized = False
+
+    async def _ensure_initialized(self):
+        if not self._initialized:
+            await self.backend.initialize()
+            self._initialized = True
 
     async def flush(self) -> None:
-        if self.file_handler:
-            await self.file_handler.flush()
-
-    async def load_cache(self) -> None:
-        if await self.cache_path.exists():
-            time_start = time.time()
-            rows: Slist[FileCacheRow] = await read_jsonl_file_into_basemodel_async(
-                path=self.cache_path,  # todo: asyncify
-                basemodel=FileCacheRow,
-            )
-            time_end = time.time()
-            n_items = len(rows)
-            time_diff_1dp = round(time_end - time_start, 1)
-            print(
-                f"Loaded {n_items} items from {self.cache_path.as_posix()} in {time_diff_1dp} seconds"
-            )
-        else:
-            rows = Slist()
-        for row in rows:
-            self.data[row.key] = row.response
-        self.loaded_cache = True
-
-    async def get_file_handler(self) -> anyio.AsyncFile:
-        if self.file_handler is None:
-            # if the file doesn't exist, create it
-            if not await self.cache_path.exists():
-                # make parent directories
-                await self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-                # make sure it's created
-                await self.cache_path.touch()
-            self.file_handler = await anyio.open_file(self.cache_path, "a")
-        return self.file_handler
+        # SQLite commits immediately, so flush is a no-op
+        pass
 
     async def add_model_call(
         self,
@@ -288,10 +229,28 @@ class APIRequestCache(Generic[APIResponse]):
         tools: ToolArgs | None,
         other_hash: str = "",
     ) -> None:
+        await self._ensure_initialized()
+
+        # Calculate cache key
         key = file_cache_key(messages, config, other_hash, tools=tools)
-        response_str = response.model_dump_json()
-        self.data[key] = response_str
-        await self.write_line(key=key, response_json=response_str)
+
+        # Serialize all data
+        timestamp = int(time.time())
+        response_json = response.model_dump_json()
+        messages_json = messages.model_dump_json()
+        config_json = config.model_dump_json()
+        tools_json = tools.model_dump_json() if tools else None
+
+        # Store in cache
+        await self.manager.put_entry(
+            cache_key=key,
+            model=self.model_name,
+            timestamp=timestamp,
+            response=response_json,
+            messages_json=messages_json,
+            config_json=config_json,
+            tools_json=tools_json
+        )
 
     async def get_model_call(
         self,
@@ -300,33 +259,25 @@ class APIRequestCache(Generic[APIResponse]):
         tools: ToolArgs | None,
         other_hash: str = "",
     ) -> Optional[APIResponse]:
-        if not self.loaded_cache:
-            async with self.cache_check_semaphore:
-                # check again
-                if not self.loaded_cache:
-                    await self.load_cache()
+        await self._ensure_initialized()
+
+        # Calculate cache key (reuse existing file_cache_key function)
         key = file_cache_key(messages, config, other_hash, tools=tools)
-        response_str = self.data.get(key)
+
+        # Get current timestamp
+        timestamp = int(time.time())
+
+        # Try to get from cache
+        response_str = await self.manager.get_entry(key, self.model_name, timestamp)
+
         if response_str:
             try:
                 response = self.response_type.model_validate_json(response_str)
                 return response
             except ValidationError as e:
                 print(f"Warning: Failed to validate cache entry for key {key}")
-                raise e
-                # return None
+                return None
         return None
-
-    async def write_line(self, key: str, response_json: str) -> None:
-        if not self.file_handler:
-            await self.get_file_handler()
-        if self.file_handler:
-            async with self.cache_check_semaphore:
-                line = (
-                    FileCacheRow(key=key, response=response_json).model_dump_json()
-                    + "\n"
-                )
-                await self.file_handler.write(line)
 
 
 def deterministic_hash(something: str) -> str:

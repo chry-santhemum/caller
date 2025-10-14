@@ -12,6 +12,9 @@ wheels/
 # Secrets
 .env
 
-# Orchestra
+# Claude
 .designer.md.swp
+designer.md
 .mcp.json
+.orchestra/
+.claude/

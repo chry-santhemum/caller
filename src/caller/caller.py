@@ -31,7 +31,7 @@ from anthropic.types.message import Message
 # from anthropic._types import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
 from anthropic._types import omit as ANTHROPIC_OMIT
 
-from llm_types import (
+from caller.llm_types import (
     APIRequestCache,
     ChatMessage,
     GenericBaseModel,
@@ -42,6 +42,26 @@ from llm_types import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Load config for cache-disabled models
+_NO_CACHE_MODELS: list[str] = []
+try:
+    import json
+    _config_path = Path("config.json")
+    if _config_path.exists():
+        with open(_config_path, "r") as f:
+            _config_data = json.load(f)
+            _NO_CACHE_MODELS = _config_data.get("no_cache_models", [])
+            if _NO_CACHE_MODELS:
+                logger.info(f"Loaded {len(_NO_CACHE_MODELS)} models with caching disabled")
+except Exception as e:
+    logger.warning(f"Could not load no_cache_models from config: {e}")
+
+
+def _is_cache_disabled_for_model(model: str) -> bool:
+    """Check if caching is disabled for this model."""
+    return model in _NO_CACHE_MODELS
 
 
 def is_thinking_model(model_name: str) -> bool:
