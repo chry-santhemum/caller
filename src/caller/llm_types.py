@@ -138,7 +138,6 @@ class ChatHistory(BaseModel):
 
 
 class InferenceConfig(BaseModel):
-    # Config for openai
     model: str
     temperature: float | None = None
     top_p: float | None = None
@@ -172,22 +171,22 @@ def file_cache_key(
     other_hash: str,
     tools: ToolArgs | None,
 ) -> str:
-    config_dump = config.model_dump_json(
-        exclude_none=True
-    )  # for backwards compatibility
-    tools_json = (
-        tools.model_dump_json() if tools is not None else ""
-    )  # for backwards compatibility
+    """Generate a deterministic cache key from API call inputs."""
+    config_dump = config.model_dump_json(exclude_none=True)
+    tools_json = tools.model_dump_json() if tools is not None else ""
+
     str_messages = (
         ",".join([str(msg) for msg in messages.messages])
         + deterministic_hash(config_dump)
         + tools_json
     )
+
     hash_of_history_not_messages = messages.model_dump(exclude_none=True)
     del hash_of_history_not_messages["messages"]
     str_history = (
         json.dumps(hash_of_history_not_messages) if hash_of_history_not_messages else ""
     )
+
     return deterministic_hash(str_messages + str_history + other_hash)
 
 
@@ -195,21 +194,26 @@ GenericBaseModel = TypeVar("GenericBaseModel", bound=BaseModel)
 
 
 class APIRequestCache(Generic[APIResponse]):
-    def __init__(self, cache_path: Path | str, response_type: Type[APIResponse]):
-        # Convert model-specific .jsonl path to shared .db path
-        # e.g., ".api_cache/gpt-4.jsonl" -> ".api_cache/cache.db"
-        cache_dir = Path(cache_path).parent
-        db_path = cache_dir / "cache.db"
+    def __init__(
+        self,
+        model_name: str,
+        backend: SQLiteCacheBackend,
+        manager: ChunkedCacheManager,
+        response_type: Type[APIResponse]
+    ):
+        """
+        Cache for a specific model's API responses.
 
-        # Extract model name from path (e.g., "gpt-4.jsonl" -> "gpt-4")
-        self.model_name = Path(cache_path).stem
+        Args:
+            model_name: Name of the model (e.g., "gpt-4", "claude-3-5-sonnet")
+            backend: Shared SQLite backend
+            manager: Shared chunked cache manager
+            response_type: Type to deserialize responses into
+        """
+        self.model_name = model_name
+        self.backend = backend
+        self.manager = manager
         self.response_type = response_type
-
-        # Initialize SQLite backend
-        self.backend = SQLiteCacheBackend(str(db_path))
-        self.manager = ChunkedCacheManager(self.backend)
-
-        # Initialize DB (async, called in get_model_call if needed)
         self._initialized = False
 
     async def _ensure_initialized(self):
@@ -218,7 +222,7 @@ class APIRequestCache(Generic[APIResponse]):
             self._initialized = True
 
     async def flush(self) -> None:
-        # SQLite commits immediately, so flush is a no-op
+        """Flush cache to disk. SQLite commits immediately, so this is a no-op."""
         pass
 
     async def add_model_call(
@@ -229,19 +233,17 @@ class APIRequestCache(Generic[APIResponse]):
         tools: ToolArgs | None,
         other_hash: str = "",
     ) -> None:
+        """Store an API call and its response in the cache."""
         await self._ensure_initialized()
 
-        # Calculate cache key
         key = file_cache_key(messages, config, other_hash, tools=tools)
 
-        # Serialize all data
         timestamp = int(time.time())
         response_json = response.model_dump_json()
         messages_json = messages.model_dump_json()
         config_json = config.model_dump_json()
         tools_json = tools.model_dump_json() if tools else None
 
-        # Store in cache
         await self.manager.put_entry(
             cache_key=key,
             model=self.model_name,
@@ -259,15 +261,12 @@ class APIRequestCache(Generic[APIResponse]):
         tools: ToolArgs | None,
         other_hash: str = "",
     ) -> Optional[APIResponse]:
+        """Retrieve a cached response for the given inputs, or None if not found."""
         await self._ensure_initialized()
 
-        # Calculate cache key (reuse existing file_cache_key function)
         key = file_cache_key(messages, config, other_hash, tools=tools)
-
-        # Get current timestamp
         timestamp = int(time.time())
 
-        # Try to get from cache
         response_str = await self.manager.get_entry(key, self.model_name, timestamp)
 
         if response_str:

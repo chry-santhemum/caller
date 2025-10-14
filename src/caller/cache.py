@@ -1,21 +1,37 @@
 """SQLite-based chunked cache system for LLM API responses."""
 
 import time
-import json
 from pathlib import Path
-from typing import Optional
 from collections import OrderedDict
 
 import aiosqlite
 from pydantic import BaseModel
 
 
+class CacheConfig(BaseModel):
+    """Configuration for cache behavior."""
+
+    # Models to never cache
+    no_cache_models: set[str] = set()
+
+    # In-memory cache settings
+    max_chunks_in_memory: int = 10  # Max number of chunks to keep in memory
+    entries_per_chunk: int = 100  # Number of entries per chunk
+
+    # Disk cache settings
+    max_age_days: int = 30  # Delete cache entries older than this
+    max_disk_size_mb: int | None = None  # Max total disk cache size (None = unlimited)
+    max_entries_per_model: int | None = None  # Max entries per model (None = unlimited)
+
+    # Cache loading behavior
+    prefetch_adjacent_chunks: int = 0  # Load N adjacent chunks on cache miss (0 = disabled)
+
+
 class CacheChunk(BaseModel):
-    """Represents a time-windowed chunk of cache entries in memory."""
+    """Represents a fixed-size chunk of cache entries in memory."""
 
     model: str
-    time_window_start: int  # Unix timestamp at hour boundary
-    time_window_end: int
+    chunk_index: int  # Chunk number (0, 1, 2, ...)
     entries: dict[str, str]  # cache_key -> response_json
     last_accessed: float  # For LRU eviction
 
@@ -39,6 +55,7 @@ class SQLiteCacheBackend:
                 CREATE TABLE IF NOT EXISTS cache_entries (
                     cache_key TEXT PRIMARY KEY,
                     model TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
                     timestamp INTEGER NOT NULL,
                     messages_json TEXT NOT NULL,
                     config_json TEXT NOT NULL,
@@ -49,8 +66,8 @@ class SQLiteCacheBackend:
             """)
 
             await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_model_timestamp
-                ON cache_entries(model, timestamp)
+                CREATE INDEX IF NOT EXISTS idx_model_chunk
+                ON cache_entries(model, chunk_index)
             """)
 
             await db.execute("""
@@ -73,17 +90,28 @@ class SQLiteCacheBackend:
                     return dict(row)
                 return None
 
+    async def get_model_entry_count(self, model: str) -> int:
+        """Get the total number of entries for a model."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM cache_entries WHERE model = ?",
+                (model,)
+            ) as cursor:
+                count = (await cursor.fetchone())[0]
+                return count
+
     async def put_entry(self, entry: dict) -> None:
         """Insert or replace a cache entry."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO cache_entries
-                (cache_key, model, timestamp, messages_json, config_json,
+                (cache_key, model, chunk_index, timestamp, messages_json, config_json,
                  response_json, tools_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entry["cache_key"],
                 entry["model"],
+                entry["chunk_index"],
                 entry["timestamp"],
                 entry["messages_json"],
                 entry["config_json"],
@@ -96,17 +124,16 @@ class SQLiteCacheBackend:
     async def get_chunk(
         self,
         model: str,
-        chunk_start: int,
-        chunk_end: int
+        chunk_index: int
     ) -> list[dict]:
-        """Get all entries in a time window for a specific model."""
+        """Get all entries in a specific chunk for a model."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT * FROM cache_entries
-                WHERE model = ? AND timestamp >= ? AND timestamp < ?
+                WHERE model = ? AND chunk_index = ?
                 ORDER BY timestamp ASC
-            """, (model, chunk_start, chunk_end)) as cursor:
+            """, (model, chunk_index)) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
@@ -164,17 +191,13 @@ class ChunkedCacheManager:
         self,
         backend: SQLiteCacheBackend,
         max_chunks: int = 10,
-        window_size: int = 3600  # 1 hour default
+        entries_per_chunk: int = 100
     ):
         self.backend = backend
         self.max_chunks = max_chunks
-        self.window_size = window_size
+        self.entries_per_chunk = entries_per_chunk
         self.chunks: dict[tuple[str, int], CacheChunk] = {}
         self.access_order: OrderedDict[tuple[str, int], None] = OrderedDict()
-
-    def get_chunk_id(self, timestamp: int) -> int:
-        """Calculate chunk ID (timestamp aligned to hour boundary)."""
-        return (timestamp // self.window_size) * self.window_size
 
     async def get_entry(
         self,
@@ -182,20 +205,26 @@ class ChunkedCacheManager:
         model: str,
         timestamp: int
     ) -> str | None:
-        """Get response from chunk or load from database."""
-        chunk_id = self.get_chunk_id(timestamp)
-        chunk_key = (model, chunk_id)
+        """Get response from cache. Queries DB directly then loads chunk if needed."""
+        # First check if we have the key in any loaded chunk for this model
+        for (m, chunk_idx), chunk in self.chunks.items():
+            if m == model and cache_key in chunk.entries:
+                self.access_order.move_to_end((m, chunk_idx))
+                chunk.last_accessed = time.time()
+                return chunk.entries[cache_key]
 
-        # Check if chunk is in memory
-        if chunk_key not in self.chunks:
-            await self.load_chunk(model, chunk_id)
+        # Not in memory, query database directly
+        entry = await self.backend.get_entry(cache_key)
+        if not entry:
+            return None
 
-        # Update access order for LRU
+        # Load the chunk that contains this entry
+        chunk_index = entry["chunk_index"]
+        await self.load_chunk(model, chunk_index)
+
+        # Return from the loaded chunk
+        chunk_key = (model, chunk_index)
         if chunk_key in self.chunks:
-            self.access_order.move_to_end(chunk_key)
-            self.chunks[chunk_key].last_accessed = time.time()
-
-            # Return entry if it exists in chunk
             return self.chunks[chunk_key].entries.get(cache_key)
 
         return None
@@ -211,10 +240,15 @@ class ChunkedCacheManager:
         tools_json: str | None = None
     ) -> None:
         """Add entry to chunk and persist to database."""
+        # Calculate chunk index based on current entry count for this model
+        entry_count = await self.backend.get_model_entry_count(model)
+        chunk_index = entry_count // self.entries_per_chunk
+
         # Persist to database first
         entry = {
             "cache_key": cache_key,
             "model": model,
+            "chunk_index": chunk_index,
             "timestamp": timestamp,
             "messages_json": messages_json,
             "config_json": config_json,
@@ -225,20 +259,17 @@ class ChunkedCacheManager:
         await self.backend.put_entry(entry)
 
         # Add to in-memory chunk
-        chunk_id = self.get_chunk_id(timestamp)
-        chunk_key = (model, chunk_id)
+        chunk_key = (model, chunk_index)
 
         # Load or create chunk
         if chunk_key not in self.chunks:
-            await self.load_chunk(model, chunk_id)
+            await self.load_chunk(model, chunk_index)
 
-        # If chunk still doesn't exist (no entries in DB for this window), create it
+        # If chunk still doesn't exist (no entries in DB for this chunk), create it
         if chunk_key not in self.chunks:
-            chunk_end = chunk_id + self.window_size
             self.chunks[chunk_key] = CacheChunk(
                 model=model,
-                time_window_start=chunk_id,
-                time_window_end=chunk_end,
+                chunk_index=chunk_index,
                 entries={},
                 last_accessed=time.time()
             )
@@ -250,9 +281,9 @@ class ChunkedCacheManager:
         # Update access order
         self.access_order.move_to_end(chunk_key)
 
-    async def load_chunk(self, model: str, chunk_id: int) -> None:
+    async def load_chunk(self, model: str, chunk_index: int) -> None:
         """Load chunk from database into memory."""
-        chunk_key = (model, chunk_id)
+        chunk_key = (model, chunk_index)
 
         # Don't reload if already in memory
         if chunk_key in self.chunks:
@@ -263,8 +294,7 @@ class ChunkedCacheManager:
             self.evict_lru_chunk()
 
         # Load from database
-        chunk_end = chunk_id + self.window_size
-        entries_data = await self.backend.get_chunk(model, chunk_id, chunk_end)
+        entries_data = await self.backend.get_chunk(model, chunk_index)
 
         # Only create chunk if there are entries
         if entries_data:
@@ -275,8 +305,7 @@ class ChunkedCacheManager:
 
             chunk = CacheChunk(
                 model=model,
-                time_window_start=chunk_id,
-                time_window_end=chunk_end,
+                chunk_index=chunk_index,
                 entries=entries,
                 last_accessed=time.time()
             )

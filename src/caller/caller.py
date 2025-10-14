@@ -12,19 +12,12 @@ from json import JSONDecodeError
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 from slist import Slist
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-    before_sleep_log,
-)
 
 import openai
 import anthropic
-from openai import AsyncOpenAI
+from openai import OpenAI, AsyncOpenAI
 from openai._types import omit as OPENAI_OMIT
-from anthropic import AsyncAnthropic
+from anthropic import Anthropic, AsyncAnthropic
 from anthropic.types.message import Message
 from anthropic._types import omit as ANTHROPIC_OMIT
 
@@ -35,10 +28,27 @@ from caller.llm_types import (
     InferenceConfig,
     ToolArgs,
 )
-from caller.cache import SQLiteCacheBackend, ChunkedCacheManager
+from caller.cache import SQLiteCacheBackend, ChunkedCacheManager, CacheConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimitConfig(BaseModel):
+    """Configuration for rate limiting behavior."""
+
+    # Thresholds for proactive waiting (only for providers with rate limit headers)
+    min_requests_remaining: int = 5  # Wait if fewer than this many requests remaining
+    min_tokens_remaining: int = 1000  # Wait if fewer than this many tokens remaining
+
+
+class RetryConfig(BaseModel):
+    """Configuration for retry behavior."""
+
+    max_attempts: int = 8  # Maximum number of retry attempts
+    min_wait_seconds: float = 1.0  # Minimum wait time between retries
+    max_wait_seconds: float = 60.0  # Maximum wait time between retries
+    exponential_multiplier: float = 2.0  # Exponential backoff multiplier
 
 
 def is_thinking_model(model_name: str) -> bool:
@@ -148,7 +158,8 @@ class HeaderRateLimiter:
     OpenRouter has no rate limit headers, so we rely on retries.
     """
 
-    def __init__(self):
+    def __init__(self, config: RateLimitConfig | None = None):
+        self.config = config or RateLimitConfig()
         self.states: dict[str, RateLimitState] = {}
         self.locks: dict[str, asyncio.Lock] = {}
 
@@ -172,11 +183,12 @@ class HeaderRateLimiter:
             if not state:
                 return
 
-            now = datetime.now()
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
             if state.requests_reset and now >= state.requests_reset:
                 return
 
-            if state.requests_remaining is not None and state.requests_remaining < 5:
+            if state.requests_remaining is not None and state.requests_remaining < self.config.min_requests_remaining:
                 if state.requests_reset:
                     wait_time = (state.requests_reset - now).total_seconds()
                     if wait_time > 0:
@@ -187,7 +199,7 @@ class HeaderRateLimiter:
                         )
                         await asyncio.sleep(wait_time)
                         return
-            if state.input_tokens_remaining is not None and state.input_tokens_remaining < 1000:
+            if state.input_tokens_remaining is not None and state.input_tokens_remaining < self.config.min_tokens_remaining:
                 if state.tokens_reset:
                     wait_time = (state.tokens_reset - now).total_seconds()
                     if wait_time > 0:
@@ -261,6 +273,7 @@ class HeaderRateLimiter:
     def _parse_reset_time(self, reset_str: str) -> datetime:
         """Parse reset time string like '7m12s' into datetime."""
         import re
+        from datetime import timezone
 
         total_seconds = 0
 
@@ -277,7 +290,7 @@ class HeaderRateLimiter:
         if ms_match:
             total_seconds += int(ms_match.group(1)) / 1000
 
-        return datetime.now() + timedelta(seconds=total_seconds)
+        return datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
 
 
 RETRYABLE_EXCEPTIONS = (
@@ -302,6 +315,7 @@ class Caller:
     Unified LLM API caller with caching, rate limiting, and retry logic.
 
     Usage:
+        # Basic usage
         caller = Caller()
 
         # Single call
@@ -309,6 +323,25 @@ class Caller:
 
         # Batch calls with shared parameters
         responses = await caller.call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
+
+        # Configure caching behavior
+        from caller import CacheConfig
+        cache_config = CacheConfig(
+            no_cache_models={"o1", "gpt-4o-realtime"},
+            max_chunks_in_memory=20,      # Keep 20 chunks in RAM
+            entries_per_chunk=100,         # 100 entries per chunk
+            max_age_days=60
+        )
+        caller = Caller(cache_config=cache_config)
+
+        # Configure rate limiting and retry behavior
+        from caller import RateLimitConfig, RetryConfig
+        rate_limit_config = RateLimitConfig(min_requests_remaining=10)
+        retry_config = RetryConfig(max_attempts=5, max_wait_seconds=30)
+        caller = Caller(
+            rate_limit_config=rate_limit_config,
+            retry_config=retry_config
+        )
 
         # Or synchronously
         response = caller.call_one_sync(messages, model="gpt-4")
@@ -322,6 +355,9 @@ class Caller:
         anthropic_api_key: str | None = None,
         openai_api_key: str | None = None,
         dotenv_path: str | Path | None = None,
+        cache_config: CacheConfig | None = None,
+        rate_limit_config: RateLimitConfig | None = None,
+        retry_config: RetryConfig | None = None,
     ):
         """
         Initialize Caller with API clients and caching.
@@ -333,6 +369,9 @@ class Caller:
             anthropic_api_key: Anthropic API key (or set ANTHROPIC_API_KEY env var)
             openai_api_key: OpenAI API key (or set OPENAI_API_KEY env var)
             dotenv_path: Path to .env file (optional)
+            cache_config: Cache configuration (CacheConfig object)
+            rate_limit_config: Rate limiting configuration (RateLimitConfig object)
+            retry_config: Retry behavior configuration (RetryConfig object)
         """
         if dotenv_path:
             load_dotenv(dotenv_path=dotenv_path)
@@ -358,28 +397,38 @@ class Caller:
 
         self.default_provider = default_provider
 
+        self.cache_config = cache_config or CacheConfig()
+        self.rate_limit_config = rate_limit_config or RateLimitConfig()
+        self.retry_config = retry_config or RetryConfig()
+
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.cache_dir / "cache.db"
-        self.cache_backend = SQLiteCacheBackend(str(db_path))
-        self.cache_manager = ChunkedCacheManager(self.cache_backend)
-        self._cache_initialized = False
+
+        # Each model will have its own database and cache manager
         self.model_caches: dict[str, APIRequestCache] = {}
 
-        self.rate_limiter = HeaderRateLimiter()
-
-    async def _ensure_cache_initialized(self):
-        """Ensure cache backend is initialized."""
-        if not self._cache_initialized:
-            await self.cache_backend.initialize()
-            self._cache_initialized = True
+        self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
 
     def _get_cache(self, model: str) -> APIRequestCache:
-        """Get or create cache for a model."""
+        """Get or create cache for a model. Each model gets its own database file."""
         if model not in self.model_caches:
-            cache_path = self.cache_dir / f"{model}.jsonl"
+            # Create per-model database file
+            # Sanitize model name for filename
+            safe_model_name = model.replace("/", "_").replace(":", "_")
+            db_path = self.cache_dir / f"{safe_model_name}.db"
+
+            # Create per-model backend and manager
+            backend = SQLiteCacheBackend(str(db_path))
+            manager = ChunkedCacheManager(
+                backend,
+                max_chunks=self.cache_config.max_chunks_in_memory,
+                entries_per_chunk=self.cache_config.entries_per_chunk,
+            )
+
             self.model_caches[model] = APIRequestCache(
-                cache_path=cache_path,
+                model_name=model,
+                backend=backend,
+                manager=manager,
                 response_type=OpenaiResponse
             )
         return self.model_caches[model]
@@ -449,8 +498,9 @@ class Caller:
 
         provider_to_use = self._get_provider(model, provider)
 
-        if not disable_cache:
-            await self._ensure_cache_initialized()
+        should_cache = not disable_cache and model not in self.cache_config.no_cache_models
+
+        if should_cache:
             cache = self._get_cache(model)
             cached_response = await cache.get_model_call(messages, config, tool_args)
             if cached_response:
@@ -463,19 +513,12 @@ class Caller:
             messages, config, provider_to_use, tool_args
         )
 
-        if not disable_cache and response.has_response() and not response.abnormal_finish:
+        if should_cache and response.has_response() and not response.abnormal_finish:
             cache = self._get_cache(model)
             await cache.add_model_call(messages, config, response, tool_args)
 
         return response
 
-    @retry(
-        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
-        wait=wait_exponential(multiplier=2, min=1, max=60),
-        stop=stop_after_attempt(8),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
-    )
     async def _call_with_retry(
         self,
         messages: ChatHistory,
@@ -485,16 +528,41 @@ class Caller:
     ) -> OpenaiResponse:
         """
         Make API call with automatic retry on transient errors.
-        Decorated with @retry for exponential backoff.
+        Uses exponential backoff configured via retry_config.
         """
-        if provider == "openrouter":
-            return await self._call_openrouter(messages, config, tool_args)
-        elif provider == "anthropic":
-            return await self._call_anthropic(messages, config, tool_args)
-        elif provider == "openai":
-            return await self._call_openai(messages, config, tool_args)
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
+        last_exception = None
+        wait_time = self.retry_config.min_wait_seconds
+
+        for attempt in range(self.retry_config.max_attempts):
+            try:
+                if provider == "openrouter":
+                    return await self._call_openrouter(messages, config, tool_args)
+                elif provider == "anthropic":
+                    return await self._call_anthropic(messages, config, tool_args)
+                elif provider == "openai":
+                    return await self._call_openai(messages, config, tool_args)
+                else:
+                    raise ValueError(f"Unknown provider: {provider}")
+            except RETRYABLE_EXCEPTIONS as e:
+                last_exception = e
+                if attempt < self.retry_config.max_attempts - 1:
+                    logger.warning(
+                        f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
+                        f"{type(e).__name__}: {str(e)[:100]}. Waiting {wait_time:.1f}s before retry."
+                    )
+                    await asyncio.sleep(wait_time)
+                    wait_time = min(
+                        wait_time * self.retry_config.exponential_multiplier,
+                        self.retry_config.max_wait_seconds
+                    )
+                else:
+                    logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
+                    raise
+
+        # Should never reach here, but just in case
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Unexpected: retry loop completed without success or exception")
 
     async def _call_openrouter(
         self,

@@ -1,6 +1,6 @@
 # Caller
 
-This simple module provides a uniform interface for making API calls to Openrouter, OpenAI and Anthropic, while handling the following automatically:
+This simple module provides a uniform interface for making API calls to Openrouter, OpenAI and Anthropic, while automatically handling the following:
 
 - Limiting max parallel requests
 - Sensible retries
@@ -9,4 +9,4 @@ This simple module provides a uniform interface for making API calls to Openrout
 
 See `demo.py` for basic usage.
 
-**Acknowledgements:** This module was based on some code shared to me by Adam Karvonen, who in turn got it from James Chua.
+**Acknowledgements:** This module was based on some code initially shared with me by Adam Karvonen, who in turn got it from James Chua.
