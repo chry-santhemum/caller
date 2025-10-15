@@ -9,4 +9,10 @@ This simple module provides a uniform interface for making API calls to Openrout
 
 See `demo.py` for basic usage.
 
-**Acknowledgements:** This module was based on some code initially shared with me by Adam Karvonen, who in turn got it from James Chua.
+## Acknowledgements
+
+This module was based on some code initially shared with me by Adam Karvonen, who in turn got it from James Chua.
+
+## To do
+
+Add support for image and tool use.

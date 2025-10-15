@@ -1,11 +1,53 @@
-"""SQLite-based chunked cache system for LLM API responses."""
+"""SQLite-based response caching."""
 
 import time
 from pathlib import Path
 from collections import OrderedDict
-
+import json
+import hashlib
+from pathlib import Path
+from typing import Optional, Type, Sequence, Generic, TypeVar
+from pydantic import BaseModel, ValidationError
 import aiosqlite
-from pydantic import BaseModel
+
+
+from caller.types import (
+    ChatHistory,
+    InferenceConfig,
+    ToolArgs,
+)
+
+
+APIResponse = TypeVar("APIResponse", bound=BaseModel)
+
+def deterministic_hash(something: str) -> str:
+    return hashlib.sha1(something.encode()).hexdigest()
+
+
+def file_cache_key(
+    messages: ChatHistory,
+    config: InferenceConfig,
+    other_hash: str,
+    tools: ToolArgs | None,
+) -> str:
+    """Generate a deterministic cache key from API call inputs."""
+    config_dump = config.model_dump_json(exclude_none=True)
+    tools_json = tools.model_dump_json() if tools is not None else ""
+
+    str_messages = (
+        ",".join([str(msg) for msg in messages.messages])
+        + deterministic_hash(config_dump)
+        + tools_json
+    )
+
+    hash_of_history_not_messages = messages.model_dump(exclude_none=True)
+    del hash_of_history_not_messages["messages"]
+    str_history = (
+        json.dumps(hash_of_history_not_messages) if hash_of_history_not_messages else ""
+    )
+
+    return deterministic_hash(str_messages + str_history + other_hash)
+
 
 
 class CacheConfig(BaseModel):
@@ -15,12 +57,10 @@ class CacheConfig(BaseModel):
     no_cache_models: set[str] = set()
 
     # In-memory cache settings
-    max_chunks_in_memory: int = 10  # Max number of chunks to keep in memory
-    entries_per_chunk: int = 100  # Number of entries per chunk
+    max_chunks_in_memory: int = 64  # Max number of chunks to keep in memory
+    entries_per_chunk: int = 128  # Number of entries per chunk
 
     # Disk cache settings
-    max_age_days: int = 30  # Delete cache entries older than this
-    max_disk_size_mb: int | None = None  # Max total disk cache size (None = unlimited)
     max_entries_per_model: int | None = None  # Max entries per model (None = unlimited)
 
     # Cache loading behavior
@@ -36,17 +76,17 @@ class CacheChunk(BaseModel):
     last_accessed: float  # For LRU eviction
 
 
-class SQLiteCacheBackend:
+class CacheBackend:
     """Async SQLite backend for persistent cache storage."""
 
-    def __init__(self, db_path: str = ".cache/caller/cache.db"):
+    def __init__(self, db_path: str | Path):
+        """
+        db_path: Path to the database file.
+        """
+        if isinstance(db_path, str):
+            db_path = Path(db_path)
         self.db_path = db_path
-        self._ensure_directory()
-
-    def _ensure_directory(self) -> None:
-        """Ensure the database directory exists."""
-        db_dir = Path(self.db_path).parent
-        db_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self) -> None:
         """Create tables and indexes if they don't exist."""
@@ -137,19 +177,6 @@ class SQLiteCacheBackend:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
-    async def cleanup_old_entries(self, max_age_days: int) -> int:
-        """Delete entries older than max_age_days and return count deleted."""
-        cutoff_timestamp = int(time.time()) - (max_age_days * 24 * 3600)
-
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "DELETE FROM cache_entries WHERE created_at < ?",
-                (cutoff_timestamp,)
-            )
-            deleted_count = cursor.rowcount
-            await db.commit()
-            return deleted_count
-
     async def get_stats(self) -> dict:
         """Return cache statistics."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -184,14 +211,14 @@ class SQLiteCacheBackend:
             }
 
 
-class ChunkedCacheManager:
+class ChunkManager:
     """Manages in-memory chunks with LRU eviction and SQLite backend."""
 
     def __init__(
         self,
-        backend: SQLiteCacheBackend,
-        max_chunks: int = 10,
-        entries_per_chunk: int = 100
+        backend: CacheBackend,
+        max_chunks: int,
+        entries_per_chunk: int
     ):
         self.backend = backend
         self.max_chunks = max_chunks
@@ -324,3 +351,87 @@ class ChunkedCacheManager:
         # Remove from both dictionaries
         del self.chunks[lru_chunk_key]
         del self.access_order[lru_chunk_key]
+
+
+
+class Cache(Generic[APIResponse]):
+    def __init__(
+        self,
+        model_name: str,
+        backend: CacheBackend,
+        manager: ChunkManager,
+        response_type: Type[APIResponse]
+    ):
+        """
+        Cache for a specific model's API responses.
+
+        Args:
+            model_name: Name of the model (e.g., "gpt-4", "claude-3-5-sonnet")
+            backend: Shared SQLite backend
+            manager: Shared chunked cache manager
+            response_type: Type to deserialize responses into
+        """
+        self.model_name = model_name
+        self.backend = backend
+        self.manager = manager
+        self.response_type = response_type
+        self._initialized = False
+
+    async def _ensure_initialized(self):
+        if not self._initialized:
+            await self.backend.initialize()
+            self._initialized = True
+
+    async def add_entry(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        response: APIResponse,
+        tools: ToolArgs | None,
+        other_hash: str = "",
+    ) -> None:
+        """Store an API call and its response in the cache."""
+        await self._ensure_initialized()
+
+        key = file_cache_key(messages, config, other_hash, tools=tools)
+
+        timestamp = int(time.time())
+        response_json = response.model_dump_json()
+        messages_json = messages.model_dump_json()
+        config_json = config.model_dump_json()
+        tools_json = tools.model_dump_json() if tools else None
+
+        await self.manager.put_entry(
+            cache_key=key,
+            model=self.model_name,
+            timestamp=timestamp,
+            response=response_json,
+            messages_json=messages_json,
+            config_json=config_json,
+            tools_json=tools_json
+        )
+
+    async def get_entry(
+        self,
+        messages: ChatHistory,
+        config: InferenceConfig,
+        tools: ToolArgs | None,
+        other_hash: str = "",
+    ) -> Optional[APIResponse]:
+        """Retrieve a cached response for the given inputs, or None if not found."""
+        await self._ensure_initialized()
+
+        key = file_cache_key(messages, config, other_hash, tools=tools)
+        timestamp = int(time.time())
+
+        response_str = await self.manager.get_entry(key, self.model_name, timestamp)
+
+        if response_str:
+            try:
+                response = self.response_type.model_validate_json(response_str)
+                return response
+            except ValidationError as e:
+                print(f"Warning: Failed to validate cache entry for key {key}")
+                return None
+        return None
+

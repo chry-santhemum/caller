@@ -57,18 +57,6 @@ async def basic_usage():
         print(f"A: {response.first_response}\n")
 
 
-    # Use as context manager
-    async with caller:
-        response = await caller.call_one(
-            messages="What is async/await?",
-            model="anthropic/claude-3.5-haiku",
-            max_tokens=100,
-        )
-        print(f"Response: {response.first_response}")
-        # Cache is automatically flushed on exit
-
-
-
 # Using different providers
 
 async def different_providers():

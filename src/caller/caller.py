@@ -4,7 +4,7 @@ Unified Caller class for LLM API calls with caching, rate limiting, and retry lo
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence, Literal
 from json import JSONDecodeError
@@ -21,34 +21,19 @@ from anthropic import Anthropic, AsyncAnthropic
 from anthropic.types.message import Message
 from anthropic._types import omit as ANTHROPIC_OMIT
 
-from caller.llm_types import (
-    APIRequestCache,
+from caller.types import (
     ChatMessage,
     ChatHistory,
     InferenceConfig,
     ToolArgs,
+    OpenaiResponse,
 )
-from caller.cache import SQLiteCacheBackend, ChunkedCacheManager, CacheConfig
+from caller.cache import CacheBackend, ChunkManager, CacheConfig, Cache
+from caller.rate_limit import RateLimitConfig, HeaderRateLimiter
 
 
 logger = logging.getLogger(__name__)
 
-
-class RateLimitConfig(BaseModel):
-    """Configuration for rate limiting behavior."""
-
-    # Thresholds for proactive waiting (only for providers with rate limit headers)
-    min_requests_remaining: int = 5  # Wait if fewer than this many requests remaining
-    min_tokens_remaining: int = 1000  # Wait if fewer than this many tokens remaining
-
-
-class RetryConfig(BaseModel):
-    """Configuration for retry behavior."""
-
-    max_attempts: int = 8  # Maximum number of retry attempts
-    min_wait_seconds: float = 1.0  # Minimum wait time between retries
-    max_wait_seconds: float = 60.0  # Maximum wait time between retries
-    exponential_multiplier: float = 2.0  # Exponential backoff multiplier
 
 
 def is_thinking_model(model_name: str) -> bool:
@@ -69,229 +54,6 @@ def is_thinking_model(model_name: str) -> bool:
     return model_name in THINKING_MODELS
 
 
-class OpenaiResponse(BaseModel):
-    """Unified response format for all providers."""
-    choices: list[dict]
-    usage: dict
-    created: int
-    model: str
-    id: str | None = None
-    system_fingerprint: str | None = None
-
-    @property
-    def first_response(self) -> str:
-        try:
-            content = self.choices[0]["message"]["content"]
-            if content is None:
-                raise ValueError(f"No content found in OpenaiResponse: {self}")
-            if isinstance(content, dict):
-                content = content.get("text", "")
-            return content
-        except (TypeError, KeyError, IndexError) as e:
-            raise ValueError(f"No content found in OpenaiResponse: {self}") from e
-
-    @property
-    def reasoning_content(self) -> str | None:
-        """Returns the reasoning content if it exists, otherwise None."""
-        try:
-            possible_keys = ["reasoning_content", "reasoning"]
-            for key in possible_keys:
-                if key in self.choices[0]["message"]:
-                    return self.choices[0]["message"][key]
-
-                content = self.choices[0]["message"].get("content")
-                if isinstance(content, dict) and key in content:
-                    return content[key]
-        except (KeyError, IndexError):
-            pass
-        return None
-
-    @property
-    def has_reasoning(self) -> bool:
-        return self.reasoning_content is not None
-
-    def has_response(self) -> bool:
-        if len(self.choices) == 0:
-            return False
-        first_choice = self.choices[0]
-        if first_choice.get("message") is None:
-            return False
-        if first_choice["message"].get("content") is None:
-            return False
-        return True
-
-    @property
-    def hit_content_filter(self) -> bool:
-        """Check if response was blocked by content filter."""
-        try:
-            first_choice = self.choices[0]
-            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
-            return finish_reason == "content_filter"
-        except (KeyError, IndexError):
-            return False
-
-    @property
-    def abnormal_finish(self) -> bool:
-        """Check if response finished abnormally."""
-        try:
-            first_choice = self.choices[0]
-            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
-            return finish_reason not in ["stop", "length", None]
-        except (KeyError, IndexError):
-            return False
-
-
-class RateLimitState(BaseModel):
-    """Rate limit state parsed from response headers."""
-    requests_remaining: int | None = None
-    requests_reset: datetime | None = None
-    tokens_remaining: int | None = None
-    tokens_reset: datetime | None = None
-    input_tokens_remaining: int | None = None
-    output_tokens_remaining: int | None = None
-
-
-class HeaderRateLimiter:
-    """
-    Rate limiter that uses response headers from APIs.
-    Only applies to Anthropic and OpenAI direct APIs.
-    OpenRouter has no rate limit headers, so we rely on retries.
-    """
-
-    def __init__(self, config: RateLimitConfig | None = None):
-        self.config = config or RateLimitConfig()
-        self.states: dict[str, RateLimitState] = {}
-        self.locks: dict[str, asyncio.Lock] = {}
-
-    def _get_lock(self, model: str) -> asyncio.Lock:
-        """Get or create lock for a model."""
-        if model not in self.locks:
-            self.locks[model] = asyncio.Lock()
-        return self.locks[model]
-
-    async def wait_if_needed(self, model: str, provider: str) -> None:
-        """
-        Check rate limits and wait if necessary.
-        Only applies to providers that return rate limit headers.
-        """
-        if provider == "openrouter":
-            return  # OpenRouter: no proactive limiting, rely on retries
-
-        lock = self._get_lock(model)
-        async with lock:
-            state = self.states.get(model)
-            if not state:
-                return
-
-            from datetime import timezone
-            now = datetime.now(timezone.utc)
-            if state.requests_reset and now >= state.requests_reset:
-                return
-
-            if state.requests_remaining is not None and state.requests_remaining < self.config.min_requests_remaining:
-                if state.requests_reset:
-                    wait_time = (state.requests_reset - now).total_seconds()
-                    if wait_time > 0:
-                        logger.warning(
-                            f"Rate limit low for {model} "
-                            f"({state.requests_remaining} requests remaining), "
-                            f"waiting {wait_time:.1f}s"
-                        )
-                        await asyncio.sleep(wait_time)
-                        return
-            if state.input_tokens_remaining is not None and state.input_tokens_remaining < self.config.min_tokens_remaining:
-                if state.tokens_reset:
-                    wait_time = (state.tokens_reset - now).total_seconds()
-                    if wait_time > 0:
-                        logger.warning(
-                            f"Token limit low for {model} "
-                            f"({state.input_tokens_remaining} input tokens remaining), "
-                            f"waiting {wait_time:.1f}s"
-                        )
-                        await asyncio.sleep(wait_time)
-
-    def update_from_headers(self, model: str, provider: str, headers: dict | None) -> None:
-        """Update rate limit state from response headers."""
-        if not headers or provider == "openrouter":
-            return
-
-        if provider == "anthropic":
-            self._parse_anthropic_headers(model, headers)
-        elif provider == "openai":
-            self._parse_openai_headers(model, headers)
-
-    def _parse_anthropic_headers(self, model: str, headers: dict) -> None:
-        """Parse Anthropic rate limit headers."""
-        try:
-            state = RateLimitState()
-
-            if "anthropic-ratelimit-requests-remaining" in headers:
-                state.requests_remaining = int(headers["anthropic-ratelimit-requests-remaining"])
-            if "anthropic-ratelimit-requests-reset" in headers:
-                state.requests_reset = datetime.fromisoformat(
-                    headers["anthropic-ratelimit-requests-reset"].replace("Z", "+00:00")
-                )
-
-            if "anthropic-ratelimit-input-tokens-remaining" in headers:
-                state.input_tokens_remaining = int(headers["anthropic-ratelimit-input-tokens-remaining"])
-
-            if "anthropic-ratelimit-output-tokens-remaining" in headers:
-                state.output_tokens_remaining = int(headers["anthropic-ratelimit-output-tokens-remaining"])
-
-            if "anthropic-ratelimit-tokens-reset" in headers:
-                state.tokens_reset = datetime.fromisoformat(
-                    headers["anthropic-ratelimit-tokens-reset"].replace("Z", "+00:00")
-                )
-
-            self.states[model] = state
-            logger.debug(f"Updated rate limits for {model}: {state}")
-        except Exception as e:
-            logger.warning(f"Failed to parse Anthropic headers: {e}")
-
-    def _parse_openai_headers(self, model: str, headers: dict) -> None:
-        """Parse OpenAI rate limit headers."""
-        try:
-            state = RateLimitState()
-
-            if "x-ratelimit-remaining-requests" in headers:
-                state.requests_remaining = int(headers["x-ratelimit-remaining-requests"])
-            if "x-ratelimit-reset-requests" in headers:
-                reset_str = headers["x-ratelimit-reset-requests"]
-                state.requests_reset = self._parse_reset_time(reset_str)
-
-            if "x-ratelimit-remaining-tokens" in headers:
-                state.tokens_remaining = int(headers["x-ratelimit-remaining-tokens"])
-            if "x-ratelimit-reset-tokens" in headers:
-                reset_str = headers["x-ratelimit-reset-tokens"]
-                state.tokens_reset = self._parse_reset_time(reset_str)
-
-            self.states[model] = state
-            logger.debug(f"Updated rate limits for {model}: {state}")
-        except Exception as e:
-            logger.warning(f"Failed to parse OpenAI headers: {e}")
-
-    def _parse_reset_time(self, reset_str: str) -> datetime:
-        """Parse reset time string like '7m12s' into datetime."""
-        import re
-        from datetime import timezone
-
-        total_seconds = 0
-
-        m_match = re.search(r'(\d+)m', reset_str)
-        if m_match:
-            total_seconds += int(m_match.group(1)) * 60
-
-        # Don't match milliseconds here
-        s_match = re.search(r'(\d+)s(?!$)', reset_str)
-        if s_match:
-            total_seconds += int(s_match.group(1))
-
-        ms_match = re.search(r'(\d+)ms', reset_str)
-        if ms_match:
-            total_seconds += int(ms_match.group(1)) / 1000
-
-        return datetime.now(timezone.utc) + timedelta(seconds=total_seconds)
-
 
 RETRYABLE_EXCEPTIONS = (
     openai.RateLimitError,
@@ -310,31 +72,32 @@ CHANCE_EXCEPTIONS = (
 )
 
 
+class RetryConfig(BaseModel):
+    """Configuration for retry behavior."""
+
+    max_attempts: int = 8  # Maximum number of retry attempts
+    min_wait_seconds: float = 1.0  # Minimum wait time between retries
+    max_wait_seconds: float = 60.0  # Maximum wait time between retries
+    exponential_multiplier: float = 2.0  # Exponential backoff multiplier
+
+
 class Caller:
     """
-    Unified LLM API caller with caching, rate limiting, and retry logic.
+    Main LLM caller class.
 
-    Usage:
-        # Basic usage
-        caller = Caller()
-
-        # Single call
-        response = await caller.call_one(messages, model="anthropic/claude-3.5-sonnet")
-
-        # Batch calls with shared parameters
-        responses = await caller.call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
-
-        # Configure caching behavior
+    Configure caching behavior:
+        ```python
         from caller import CacheConfig
         cache_config = CacheConfig(
             no_cache_models={"o1", "gpt-4o-realtime"},
             max_chunks_in_memory=20,      # Keep 20 chunks in RAM
-            entries_per_chunk=100,         # 100 entries per chunk
-            max_age_days=60
+            entries_per_chunk=100,        # 100 entries per chunk
         )
         caller = Caller(cache_config=cache_config)
+        ```
 
-        # Configure rate limiting and retry behavior
+    Configure rate limiting and retry behavior:
+        ```python
         from caller import RateLimitConfig, RetryConfig
         rate_limit_config = RateLimitConfig(min_requests_remaining=10)
         retry_config = RetryConfig(max_attempts=5, max_wait_seconds=30)
@@ -342,18 +105,14 @@ class Caller:
             rate_limit_config=rate_limit_config,
             retry_config=retry_config
         )
-
-        # Or synchronously
-        response = caller.call_one_sync(messages, model="gpt-4")
+        ```
     """
 
     def __init__(
         self,
         cache_dir: str = ".cache/caller",
-        default_provider: str = "openrouter",
-        openrouter_api_key: str | None = None,
-        anthropic_api_key: str | None = None,
-        openai_api_key: str | None = None,
+        provider: Literal["anthropic", "openai", "openrouter"] = "openrouter",
+        api_key: str | None = None,
         dotenv_path: str | Path | None = None,
         cache_config: CacheConfig | None = None,
         rate_limit_config: RateLimitConfig | None = None,
@@ -363,40 +122,31 @@ class Caller:
         Initialize Caller with API clients and caching.
 
         Args:
-            cache_dir: Directory for SQLite cache
-            default_provider: Default provider to use (always "openrouter" by default)
-            openrouter_api_key: OpenRouter API key (or set OPENROUTER_API_KEY env var)
-            anthropic_api_key: Anthropic API key (or set ANTHROPIC_API_KEY env var)
-            openai_api_key: OpenAI API key (or set OPENAI_API_KEY env var)
-            dotenv_path: Path to .env file (optional)
+            cache_dir: Base directory for SQLite cache
             cache_config: Cache configuration (CacheConfig object)
             rate_limit_config: Rate limiting configuration (RateLimitConfig object)
             retry_config: Retry behavior configuration (RetryConfig object)
         """
-        if dotenv_path:
-            load_dotenv(dotenv_path=dotenv_path)
-        else:
-            load_dotenv()
+        load_dotenv()
+        self.provider = provider
 
-        self.openrouter_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
-        self.anthropic_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-
-        self.openrouter_client = AsyncOpenAI(
-            api_key=self.openrouter_key,
-            base_url="https://openrouter.ai/api/v1"
-        ) if self.openrouter_key else None
-
-        self.anthropic_client = AsyncAnthropic(
-            api_key=self.anthropic_key
-        ) if self.anthropic_key else None
-
-        self.openai_client = AsyncOpenAI(
-            api_key=self.openai_key
-        ) if self.openai_key else None
-
-        self.default_provider = default_provider
-
+        if provider == "openrouter":
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+            self.client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url="https://openrouter.ai/api/v1"
+            )
+        elif provider == "anthropic":
+            self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+            self.client = AsyncAnthropic(
+                api_key=self.api_key
+            )
+        elif provider == "openai":
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+            self.client = AsyncOpenAI(
+                api_key=self.api_key
+            )
+        
         self.cache_config = cache_config or CacheConfig()
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self.retry_config = retry_config or RetryConfig()
@@ -405,27 +155,28 @@ class Caller:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Each model will have its own database and cache manager
-        self.model_caches: dict[str, APIRequestCache] = {}
+        self.model_caches: dict[str, Cache] = {}
 
         self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
 
-    def _get_cache(self, model: str) -> APIRequestCache:
+
+    def _get_cache(self, model: str) -> Cache:
         """Get or create cache for a model. Each model gets its own database file."""
         if model not in self.model_caches:
             # Create per-model database file
             # Sanitize model name for filename
-            safe_model_name = model.replace("/", "_").replace(":", "_")
+            safe_model_name = model.replace(":", "_")
             db_path = self.cache_dir / f"{safe_model_name}.db"
 
             # Create per-model backend and manager
-            backend = SQLiteCacheBackend(str(db_path))
-            manager = ChunkedCacheManager(
+            backend = CacheBackend(str(db_path))
+            manager = ChunkManager(
                 backend,
                 max_chunks=self.cache_config.max_chunks_in_memory,
                 entries_per_chunk=self.cache_config.entries_per_chunk,
             )
 
-            self.model_caches[model] = APIRequestCache(
+            self.model_caches[model] = Cache(
                 model_name=model,
                 backend=backend,
                 manager=manager,
@@ -433,20 +184,12 @@ class Caller:
             )
         return self.model_caches[model]
 
-    def _get_provider(self, model: str, provider_override: str | None = None) -> str:
-        """
-        Determine which provider to use.
-        Default: always openrouter (as specified by user).
-        """
-        if provider_override:
-            return provider_override
-        return self.default_provider
 
     async def call_one(
         self,
         messages: ChatHistory | Sequence[ChatMessage] | str,
         model: str,
-        provider: str | None = None,
+        provider: Literal["anthropic", "openai", "openrouter"] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -496,13 +239,13 @@ class Caller:
             extra_body=extra_body,
         )
 
-        provider_to_use = self._get_provider(model, provider)
+        provider_to_use = self.provider if provider is None else provider
 
         should_cache = not disable_cache and model not in self.cache_config.no_cache_models
 
         if should_cache:
             cache = self._get_cache(model)
-            cached_response = await cache.get_model_call(messages, config, tool_args)
+            cached_response = await cache.get_entry(messages, config, tool_args)
             if cached_response:
                 logger.debug(f"Cache hit for model {model}")
                 return cached_response
@@ -515,7 +258,7 @@ class Caller:
 
         if should_cache and response.has_response() and not response.abnormal_finish:
             cache = self._get_cache(model)
-            await cache.add_model_call(messages, config, response, tool_args)
+            await cache.add_entry(messages, config, response, tool_args)
 
         return response
 
@@ -852,14 +595,3 @@ class Caller:
         )
         return list(responses)
 
-    async def flush(self):
-        """Flush cache to disk. SQLite commits immediately, so this is mostly a no-op."""
-        pass
-
-    async def __aenter__(self):
-        """Context manager entry."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        """Context manager exit."""
-        await self.flush()
