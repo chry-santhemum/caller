@@ -2,6 +2,7 @@
 
 import time
 import hashlib
+import asyncio
 from pathlib import Path
 from collections import OrderedDict
 from typing import Optional, Type, Generic, TypeVar
@@ -81,86 +82,101 @@ class Backend:
         self.model = model
         self.safe_model_name = model.replace("/", "_").replace(":", "_")
         self.db_path = db_path / f"{self.safe_model_name}.db"
+        self._connection: aiosqlite.Connection | None = None
 
+
+    async def _get_connection(self) -> aiosqlite.Connection:
+        """Get or create a persistent connection."""
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(self.db_path)
+        return self._connection
 
     async def initialize(self) -> None:
         """Create tables and indexes if they don't exist."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cache_entries (
-                    cache_key TEXT PRIMARY KEY,
-                    str_key TEXT NOT NULL,
-                    response_json TEXT NOT NULL,
-                    chunk_index INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL
-                )
-            """)
+        db = await self._get_connection()
 
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_chunk_index
-                ON cache_entries(chunk_index)
-            """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cache_entries (
+                cache_key TEXT PRIMARY KEY,
+                str_key TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
 
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_created_at
-                ON cache_entries(created_at)
-            """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunk_index
+            ON cache_entries(chunk_index)
+        """)
 
-            await db.commit()
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_created_at
+            ON cache_entries(created_at)
+        """)
+
+        await db.commit()
 
 
     async def get_entry(self, cache_key: str) -> dict | None:
         """Get a single cache entry by key."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM cache_entries WHERE cache_key = ?",
-                (cache_key,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return dict(row)
-                return None
+        db = await self._get_connection()
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM cache_entries WHERE cache_key = ?",
+            (cache_key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
 
     async def get_entry_count(self) -> int:
         """Get the total number of entries."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM cache_entries"
-            ) as cursor:
-                count = (await cursor.fetchone())[0]
-                return count
+        db = await self._get_connection()
+        async with db.execute(
+            "SELECT COUNT(*) FROM cache_entries"
+        ) as cursor:
+            count = (await cursor.fetchone())[0]
+            return count
 
     async def put_entry(self, entry: dict) -> None:
         """Insert or replace a cache entry."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO cache_entries
-                (cache_key, str_key, response_json, chunk_index, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                entry["cache_key"],
-                entry["str_key"],
-                entry["response_json"],
-                entry["chunk_index"],
-                entry["created_at"]
-            ))
-            await db.commit()
+        db = await self._get_connection()
+
+        await db.execute("""
+            INSERT OR REPLACE INTO cache_entries
+            (cache_key, str_key, response_json, chunk_index, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            entry["cache_key"],
+            entry["str_key"],
+            entry["response_json"],
+            entry["chunk_index"],
+            entry["created_at"]
+        ))
+        await db.commit()
 
     async def get_chunk(
         self,
         chunk_index: int
     ) -> list[dict]:
         """Get all entries in a specific chunk for a model."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("""
-                SELECT * FROM cache_entries
-                WHERE chunk_index = ?
-                ORDER BY created_at ASC
-            """, (chunk_index,)) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        db = await self._get_connection()
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM cache_entries
+            WHERE chunk_index = ?
+            ORDER BY created_at ASC
+        """, (chunk_index,)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def close(self) -> None:
+        """Close the database connection."""
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
 
 
 class ChunkManager:
@@ -311,11 +327,14 @@ class Cache(Generic[APIResponse]):
         self.response_type = response_type
         self.cache_config = cache_config
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def _ensure_initialized(self):
         if not self._initialized:
-            await self.backend.initialize()
-            self._initialized = True
+            async with self._init_lock:  # Prevent concurrent initialization
+                if not self._initialized:  # Double-check after acquiring lock
+                    await self.backend.initialize()
+                    self._initialized = True
 
     async def put_entry(
         self,
@@ -357,4 +376,8 @@ class Cache(Generic[APIResponse]):
                 print(f"Warning: Failed to validate cache entry for key {cache_key}")
                 return None
         return None
+
+    async def close(self) -> None:
+        """Close the backend connection."""
+        await self.backend.close()
 

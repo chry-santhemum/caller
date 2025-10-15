@@ -140,9 +140,9 @@ class Caller:
             self.client = AsyncOpenAI(
                 api_key=self.api_key
             )
-        
+
         assert self.api_key is not None
-        
+
         self.cache_config = cache_config or CacheConfig()
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self.retry_config = retry_config or RetryConfig()
@@ -152,6 +152,7 @@ class Caller:
 
         # Each model will have its own database and chunk manager
         self.model_caches: dict[str, Cache] = {}
+        self._cache_lock = asyncio.Lock()  # Lock for cache creation
 
         self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
 
@@ -251,7 +252,7 @@ class Caller:
         should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models)
 
         if should_cache:
-            cache = self._get_cache(model)
+            cache = await self._get_cache(model)
             cached_response = await cache.get_entry(messages, config, tool_args)
             if cached_response:
                 logger.debug(f"Cache hit for model {model}")
@@ -264,11 +265,11 @@ class Caller:
         )
 
         if should_cache and response.has_response() and not response.abnormal_finish:
-            cache = self._get_cache(model)
+            cache = await self._get_cache(model)
             await cache.put_entry(
-                response=response, 
-                messages=messages, 
-                config=config, 
+                response=response,
+                messages=messages,
+                config=config,
                 tools=tool_args,
             )
 
@@ -338,15 +339,15 @@ class Caller:
         to_pass_extra_body.update(to_pass_reasoning)
         if config.model == "meta-llama/llama-3.1-8b-instruct":
             to_pass_extra_body = {
-                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"]}
+                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"], 'allow_fallbacks': False}
             }
         elif config.model == "meta-llama/llama-3.1-70b-instruct":
             to_pass_extra_body = {
-                "provider": {"order": ["deepinfra/turbo", "fireworks"]}
+                "provider": {"order": ["deepinfra/turbo", "fireworks"], 'allow_fallbacks': False}
             }
         elif config.model.startswith("anthropic/"):
             to_pass_extra_body = {
-                "provider": {"order": ["google-vertex", "anthropic"]}
+                "provider": {"order": ["google-vertex", "anthropic"], 'allow_fallbacks': False}
             }
 
         logger.debug(f"Calling OpenRouter with model: {config.model}")
@@ -457,22 +458,16 @@ class Caller:
                     error_data = response.json() if response.text else {}
                     error_message = error_data.get("error", {}).get("message", response.text)
 
-                    # Map to appropriate exception types
-                    if response.status_code == 429:
-                        raise anthropic.RateLimitError(f"Rate limit exceeded: {error_message}")
-                    elif response.status_code == 500:
-                        raise anthropic.InternalServerError(f"Internal server error: {error_message}")
-                    elif response.status_code == 529:
-                        raise anthropic._exceptions.OverloadedError(f"API overloaded: {error_message}")
-                    else:
-                        raise anthropic.APIError(f"API error ({response.status_code}): {error_message}")
+                    # Raise as ValueError which is in RETRYABLE_EXCEPTIONS
+                    # We can't use Anthropic SDK exceptions as they require the SDK response object
+                    raise ValueError(f"Anthropic API error ({response.status_code}): {error_message}")
 
                 raw_response = response.json()
 
             except httpx.TimeoutException:
-                raise anthropic.APITimeoutError("Request timed out")
+                raise ValueError("Request timed out")
             except httpx.ConnectError as e:
-                raise anthropic.APIConnectionError(f"Connection error: {e}")
+                raise ValueError(f"Connection error: {e}")
 
         # Process response based on content type
         if raw_response["content"][0]["type"] == "thinking":
@@ -562,33 +557,33 @@ class Caller:
                     error_data = response.json() if response.text else {}
                     error_message = error_data.get("error", {}).get("message", response.text)
 
-                    # Map to appropriate exception types
-                    if response.status_code == 429:
-                        raise openai.RateLimitError(f"Rate limit exceeded: {error_message}")
-                    elif response.status_code == 500:
-                        raise openai.InternalServerError(f"Internal server error: {error_message}")
-                    elif response.status_code == 408:
-                        raise openai.APITimeoutError(f"Request timeout: {error_message}")
-                    else:
-                        raise openai.APIError(f"API error ({response.status_code}): {error_message}")
+                    # Raise as ValueError which is in RETRYABLE_EXCEPTIONS
+                    # We can't use OpenAI SDK exceptions as they require the SDK response object
+                    raise ValueError(f"OpenAI API error ({response.status_code}): {error_message}")
 
                 raw_response = response.json()
 
             except httpx.TimeoutException:
-                raise openai.APITimeoutError("Request timed out")
+                raise ValueError("Request timed out")
             except httpx.ConnectError as e:
-                raise openai.APIConnectionError(f"Connection error: {e}")
+                raise ValueError(f"Connection error: {e}")
 
         response = OpenaiResponse.model_validate(raw_response)
 
         return response
 
-    def _get_cache(self, model: str) -> Cache:
+    async def _get_cache(self, model: str) -> Cache:
         """Get or create cache for a model. Each model gets its own database file."""
-        if model not in self.model_caches:
-            self.model_caches[model] = Cache(
-                model_name=model,
-                response_type=OpenaiResponse,
-                cache_config=self.cache_config,
-            )
+        async with self._cache_lock:  # Ensure only one cache is created per model
+            if model not in self.model_caches:
+                self.model_caches[model] = Cache(
+                    model_name=model,
+                    response_type=OpenaiResponse,
+                    cache_config=self.cache_config,
+                )
         return self.model_caches[model]
+
+    async def close(self):
+        """Close all cache connections."""
+        for cache in self.model_caches.values():
+            await cache.close()
