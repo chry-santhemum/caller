@@ -4,7 +4,7 @@ Example usage of the Caller library.
 import asyncio
 import time
 from contextlib import contextmanager
-from caller import Caller
+from caller import Caller, CacheConfig
 
 
 @contextmanager
@@ -16,101 +16,61 @@ def timer(description: str = "Operation"):
     print(f"  [{description}] took {elapsed:.3f}s")
 
 
+cache_config = CacheConfig(
+    no_cache_models={"meta-llama/llama-3.1-8b-instruct"},
+)
+
+# Initialize the caller
+
+caller = Caller(cache_config=cache_config)
+
+
 async def basic_usage():
-    # Initialize the caller
-    caller = Caller()
-
-    # One message
-    response = await caller.call_one(
-        messages="What is the capital of France?",
-        model="anthropic/claude-3.5-haiku",
-        max_tokens=50,
-    )
-
-    print(f"Answer: {response.first_response}")
-    print(f"Tokens used: {response.usage}")
-
-
-    # Multiple messages with shared parameters
-    questions = [
-        "What is the capital of Japan?",
-        "What is the capital of Germany?",
-        "What is the capital of Brazil?",
+    messages = [
+        "What is the capital of Japan? Respond with a poem.",
+        "What is the capital of Germany? Respond with a poem.",
+        "What is the capital of Brazil? Respond with a poem.",
     ]
-
-    print(f"Processing {len(questions)} questions in parallel...\n")
 
     # Process in parallel with shared parameters
     responses = await caller.call(
-        questions,
-        model="anthropic/claude-3.5-haiku",
-        max_tokens=30,
-        max_parallel=3
+        messages=messages,
+        max_parallel=128,
+        model="meta-llama/llama-3.1-8b-instruct",
+        desc="Sending prompts",
+        max_tokens=128
     )
 
-    for question, response in zip(questions, responses):
+    print(f"Responses: {responses}")
+
+    for question, response in zip(messages, responses):
         print(f"Q: {question}")
         print(f"A: {response.first_response}\n")
-
-
-# Using different providers
-
-async def different_providers():
-    caller = Caller()
-
-    # Default: all models use OpenRouter
-    response = await caller.call_one(
-        messages="Say hello",
-        model="anthropic/claude-3.5-haiku",  # via OpenRouter
-        max_tokens=10,
-    )
-    print(f"   {response.first_response}")
-
-    # Explicitly use Anthropic Direct API
-    response = await caller.call_one(
-        messages="Say hello",
-        model="claude-sonnet-4-5-20250929",
-        provider="anthropic",  # Explicit override
-        max_tokens=10,
-    )
-    print(f"   {response.first_response}")
-
-    # Explicitly use OpenAI Direct API
-    response = await caller.call_one(
-        messages="Say hello",
-        model="gpt-5-mini",
-        provider="openai",  # Explicit override
-        max_tokens=10,
-    )
-    print(f"   {response.first_response}")
-
 
 
 # Response caching
 
 async def cache_demo():
-    caller = Caller()
 
-    message = "What is 2+2?"
-    model = "anthropic/claude-sonnet-4-5-20250929"
+    message = "Who is Yo Mama?"
+    model = "meta-llama/llama-3.1-70b-instruct"
 
-    print("First call (hits API)...")
+    print("First call...")
     with timer("API call"):
-        response1 = await caller.call_one(message, model=model, max_tokens=10)
+        response1 = await caller.call_one(messages=message, model=model, max_tokens=128)
     print(f"  Response: {response1.first_response}")
 
-    print("\nSecond call (hits cache)...")
+    print("\nSecond call...")
     with timer("Cache hit"):
-        response2 = await caller.call_one(message, model=model, max_tokens=10)
+        response2 = await caller.call_one(messages=message, model=model, max_tokens=128)
     print(f"  Response: {response2.first_response}")
-    print(f"  Same as first? {response1.first_response == response2.first_response}")
 
-    print("\nThird call with different parameters (hits API)...")
+    print("\nThird call...")
     with timer("API call"):
-        response3 = await caller.call_one(message, model=model, max_tokens=10, temperature=0.9)
+        response3 = await caller.call_one(messages=message, model=model, max_tokens=128, temperature=0.9)
     print(f"  Response: {response3.first_response}")
 
 
 
 if __name__ == "__main__":
-    asyncio.run(basic_usage())
+    asyncio.run(cache_demo())

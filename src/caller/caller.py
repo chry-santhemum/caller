@@ -1,6 +1,7 @@
 """
 Unified Caller class for LLM API calls with caching, rate limiting, and retry logic.
 """
+import caller.patches
 import os
 import asyncio
 import logging
@@ -484,8 +485,9 @@ class Caller:
     async def call(
         self,
         messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
+        max_parallel: int,
         model: str | None = None,
-        max_parallel: int = 10,
+        desc: str = "",  # Description for tqdm
         **kwargs
     ) -> list[OpenaiResponse]:
         """
@@ -530,7 +532,8 @@ class Caller:
         responses = await Slist(requests).par_map_async(
             func=lambda req: self.call_one(**req),
             max_par=max_parallel,
-            tqdm=True,
+            tqdm=desc != "",
+            desc=desc,
         )
         return list(responses)
 
