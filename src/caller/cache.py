@@ -1,6 +1,5 @@
 """SQLite-based response caching."""
 
-from functools import cache
 import time
 import hashlib
 from pathlib import Path

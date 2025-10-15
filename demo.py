@@ -4,8 +4,7 @@ Example usage of the Caller library.
 import asyncio
 import time
 from contextlib import contextmanager
-from pathlib import Path
-from caller import Caller, ChatHistory
+from caller import Caller
 
 
 @contextmanager
@@ -19,10 +18,7 @@ def timer(description: str = "Operation"):
 
 async def basic_usage():
     # Initialize the caller
-    caller = Caller(
-        cache_dir=".cache/caller",
-        dotenv_path=Path(".env")
-    )
+    caller = Caller()
 
     # One message
     response = await caller.call_one(

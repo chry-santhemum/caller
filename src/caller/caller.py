@@ -15,9 +15,9 @@ from slist import Slist
 
 import openai
 import anthropic
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from openai._types import omit as OPENAI_OMIT
-from anthropic import Anthropic, AsyncAnthropic
+from anthropic import AsyncAnthropic
 from anthropic.types.message import Message
 from anthropic._types import omit as ANTHROPIC_OMIT
 
@@ -28,8 +28,8 @@ from caller.types import (
     ToolArgs,
     OpenaiResponse,
 )
-from caller.cache import Backend, ChunkManager, CacheConfig, Cache
-from caller.rate_limit import RateLimitConfig, HeaderRateLimiter
+from caller.cache import CacheConfig, Cache
+from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
 
 
 logger = logging.getLogger(__name__)
