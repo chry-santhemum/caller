@@ -28,7 +28,7 @@ from caller.types import (
     ToolArgs,
     OpenaiResponse,
 )
-from caller.cache import CacheBackend, ChunkManager, CacheConfig, Cache
+from caller.cache import Backend, ChunkManager, CacheConfig, Cache
 from caller.rate_limit import RateLimitConfig, HeaderRateLimiter
 
 
@@ -127,7 +127,7 @@ class Caller:
             rate_limit_config: Rate limiting configuration (RateLimitConfig object)
             retry_config: Retry behavior configuration (RetryConfig object)
         """
-        load_dotenv()
+        load_dotenv(dotenv_path)
         self.provider = provider
 
         if provider == "openrouter":
@@ -163,24 +163,10 @@ class Caller:
     def _get_cache(self, model: str) -> Cache:
         """Get or create cache for a model. Each model gets its own database file."""
         if model not in self.model_caches:
-            # Create per-model database file
-            # Sanitize model name for filename
-            safe_model_name = model.replace(":", "_")
-            db_path = self.cache_dir / f"{safe_model_name}.db"
-
-            # Create per-model backend and manager
-            backend = CacheBackend(str(db_path))
-            manager = ChunkManager(
-                backend,
-                max_chunks=self.cache_config.max_chunks_in_memory,
-                entries_per_chunk=self.cache_config.entries_per_chunk,
-            )
-
             self.model_caches[model] = Cache(
                 model_name=model,
-                backend=backend,
-                manager=manager,
-                response_type=OpenaiResponse
+                response_type=OpenaiResponse,
+                cache_config=self.cache_config,
             )
         return self.model_caches[model]
 
@@ -189,7 +175,6 @@ class Caller:
         self,
         messages: ChatHistory | Sequence[ChatMessage] | str,
         model: str,
-        provider: Literal["anthropic", "openai", "openrouter"] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
@@ -203,24 +188,6 @@ class Caller:
     ) -> OpenaiResponse:
         """
         Make a single async API call.
-
-        Args:
-            messages: Chat messages (ChatHistory, list of ChatMessage, or single string)
-            model: Model name (e.g., "anthropic/claude-3.5-sonnet", "gpt-4")
-            provider: Override provider ("openrouter", "anthropic", "openai")
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            top_p: Nucleus sampling parameter
-            frequency_penalty: Frequency penalty
-            presence_penalty: Presence penalty
-            response_format: Response format specification
-            reasoning: Reasoning configuration for thinking models
-            extra_body: Extra parameters for the API
-            tool_args: Tool/function calling arguments
-            disable_cache: Skip cache lookup and storage
-
-        Returns:
-            OpenaiResponse with the model's response
         """
         if isinstance(messages, str):
             messages = ChatHistory.from_user(messages)
@@ -239,9 +206,7 @@ class Caller:
             extra_body=extra_body,
         )
 
-        provider_to_use = self.provider if provider is None else provider
-
-        should_cache = not disable_cache and model not in self.cache_config.no_cache_models
+        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models)
 
         if should_cache:
             cache = self._get_cache(model)
@@ -250,15 +215,20 @@ class Caller:
                 logger.debug(f"Cache hit for model {model}")
                 return cached_response
 
-        await self.rate_limiter.wait_if_needed(model, provider_to_use)
+        await self.rate_limiter.wait_if_needed(model, self.provider)
 
         response = await self._call_with_retry(
-            messages, config, provider_to_use, tool_args
+            messages, config, tool_args
         )
 
         if should_cache and response.has_response() and not response.abnormal_finish:
             cache = self._get_cache(model)
-            await cache.add_entry(messages, config, response, tool_args)
+            await cache.put_entry(
+                response=response, 
+                messages=messages, 
+                config=config, 
+                tools=tool_args,
+            )
 
         return response
 
@@ -266,7 +236,6 @@ class Caller:
         self,
         messages: ChatHistory,
         config: InferenceConfig,
-        provider: str,
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
         """
@@ -278,14 +247,13 @@ class Caller:
 
         for attempt in range(self.retry_config.max_attempts):
             try:
-                if provider == "openrouter":
+                if self.provider == "openrouter":
                     return await self._call_openrouter(messages, config, tool_args)
-                elif provider == "anthropic":
+                elif self.provider == "anthropic":
                     return await self._call_anthropic(messages, config, tool_args)
-                elif provider == "openai":
+                elif self.provider == "openai":
                     return await self._call_openai(messages, config, tool_args)
-                else:
-                    raise ValueError(f"Unknown provider: {provider}")
+
             except RETRYABLE_EXCEPTIONS as e:
                 last_exception = e
                 if attempt < self.retry_config.max_attempts - 1:
@@ -314,8 +282,7 @@ class Caller:
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
         """Call OpenRouter API."""
-        if not self.openrouter_client:
-            raise ValueError("OpenRouter API key not provided")
+        assert self.provider == "openrouter"
 
         # Handle thinking models
         if is_thinking_model(config.model):
@@ -363,7 +330,7 @@ class Caller:
             create_kwargs.update(to_pass_reasoning)
 
         try:
-            chat_completion = await self.openrouter_client.chat.completions.create(**create_kwargs)
+            chat_completion = await self.client.chat.completions.create(**create_kwargs)
         except Exception as e:
             note = f"Model: {config.model}. Provider: openrouter"
             e.add_note(note)
@@ -382,8 +349,7 @@ class Caller:
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
         """Call Anthropic API directly."""
-        if not self.anthropic_client:
-            raise ValueError("Anthropic API key not provided")
+        assert self.provider == "anthropic"
 
         # Separate system messages
         non_system = [msg for msg in messages.messages if msg.role != "system"]
@@ -431,7 +397,7 @@ class Caller:
         if config.extra_body:
             create_kwargs["extra_body"] = config.extra_body
 
-        raw_response: Message = await self.anthropic_client.messages.create(**create_kwargs)
+        raw_response: Message = await self.client.messages.create(**create_kwargs)
 
         # Note: The anthropic SDK doesn't expose headers directly on the response object
         # We'd need to use httpx directly to get headers, which we'll skip for now
@@ -471,8 +437,7 @@ class Caller:
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
         """Call OpenAI API directly."""
-        if not self.openai_client:
-            raise ValueError("OpenAI API key not provided")
+        assert self.provider == "openai"
 
         # Handle thinking models
         if is_thinking_model(config.model):
@@ -506,7 +471,7 @@ class Caller:
         if to_pass_reasoning:
             create_kwargs.update(to_pass_reasoning)
 
-        chat_completion = await self.openai_client.chat.completions.create(**create_kwargs)
+        chat_completion = await self.client.chat.completions.create(**create_kwargs)
 
         response = OpenaiResponse.model_validate(chat_completion.model_dump())
 
@@ -515,32 +480,6 @@ class Caller:
 
         return response
 
-    def call_one_sync(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage] | str,
-        model: str,
-        **kwargs
-    ) -> OpenaiResponse:
-        """
-        Synchronous wrapper around async call_one().
-
-        Args:
-            Same as call_one()
-
-        Returns:
-            OpenaiResponse
-        """
-        try:
-            asyncio.get_running_loop()
-            raise RuntimeError(
-                "call_one_sync() cannot be called from an async context. "
-                "Use await caller.call_one() instead."
-            )
-        except RuntimeError as e:
-            if "no running event loop" in str(e).lower():
-                return asyncio.run(self.call_one(messages, model, **kwargs))
-            else:
-                raise
 
     async def call(
         self,
