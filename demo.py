@@ -16,32 +16,33 @@ def timer(description: str = "Operation"):
     print(f"  [{description}] took {elapsed:.3f}s")
 
 
+# Initialize the caller
+# You could specify a custom cache_config, retry_config, and rate_limit_config
+
 cache_config = CacheConfig(
     no_cache_models={"meta-llama/llama-3.1-8b-instruct"},
 )
-
-# Initialize the caller
 
 caller = Caller(cache_config=cache_config)
 
 
 async def basic_usage():
     messages = [
-        "What is the capital of Japan? Respond with a poem.",
-        "What is the capital of Germany? Respond with a poem.",
-        "What is the capital of Brazil? Respond with a poem.",
+        "What is the expected number of times do I have to throw a coin before I first get a sequence of HTH?",
     ]
 
     # Process in parallel with shared parameters
     responses = await caller.call(
         messages=messages,
         max_parallel=128,
-        model="meta-llama/llama-3.1-8b-instruct",
+        model="anthropic/claude-sonnet-4.5",
         desc="Sending prompts",
-        max_tokens=128
+        disable_cache=True,
+        max_tokens=4096,
+        reasoning={"max_tokens": 3000}
     )
 
-    print(f"Responses: {responses}")
+    print("Reasoning content: ", responses[0].reasoning_content)
 
     for question, response in zip(messages, responses):
         print(f"Q: {question}")
@@ -73,4 +74,4 @@ async def cache_demo():
 
 
 if __name__ == "__main__":
-    asyncio.run(cache_demo())
+    asyncio.run(basic_usage())

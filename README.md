@@ -15,4 +15,4 @@ This module was based on some code initially shared with me by Adam Karvonen, wh
 
 ## To do
 
-Add support for image and tool use.
+Tool use and image arguments are not working yet.

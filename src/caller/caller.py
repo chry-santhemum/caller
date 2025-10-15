@@ -36,26 +36,26 @@ from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
 logger = logging.getLogger(__name__)
 
 
-
+# TODO: Find a better way to do this
 def is_thinking_model(model_name: str) -> bool:
-    """Whether or not there is an explicit thinking mode for this model."""
+    model_name_without_provider = model_name.split("/")[-1]
     THINKING_MODELS = [
-        "claude-opus-4-1-20250805",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-20250514",
-        "claude-3-7-sonnet-20250219",
-        "google/gemini-2.5-pro",
-        "google/gemini-2.5-flash",
-        "openai/gpt-5",
-        "openai/gpt-5-nano",
-        "openai/gpt-5-mini",
-        "openai/o3",
-        "deepseek/deepseek-r1",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-3-7-sonnet",
+        "gemini-2.5",
+        "gpt-5",
+        "o3",
+        "deepseek-r1",
     ]
-    return model_name in THINKING_MODELS
+    for model in THINKING_MODELS:
+        if model_name_without_provider.startswith(model):
+            print(f"{model_name} is a thinking model")
+            return True
+    return False
 
 
-
+# TODO: Some of these probably shouldn't be retried
 RETRYABLE_EXCEPTIONS = (
     openai.RateLimitError,
     openai.APITimeoutError,
@@ -64,9 +64,6 @@ RETRYABLE_EXCEPTIONS = (
     anthropic.RateLimitError,
     anthropic.InternalServerError,
     anthropic._exceptions.OverloadedError,
-)
-
-CHANCE_EXCEPTIONS = (
     ValidationError,
     JSONDecodeError,
     ValueError,
@@ -78,7 +75,7 @@ class RetryConfig(BaseModel):
 
     max_attempts: int = 8  # Maximum number of retry attempts
     min_wait_seconds: float = 1.0  # Minimum wait time between retries
-    max_wait_seconds: float = 60.0  # Maximum wait time between retries
+    max_wait_seconds: float = 30.0  # Maximum wait time between retries
     exponential_multiplier: float = 2.0  # Exponential backoff multiplier
 
 
@@ -111,7 +108,6 @@ class Caller:
 
     def __init__(
         self,
-        cache_dir: str = ".cache/caller",
         provider: Literal["anthropic", "openai", "openrouter"] = "openrouter",
         api_key: str | None = None,
         dotenv_path: str | Path | None = None,
@@ -123,7 +119,6 @@ class Caller:
         Initialize Caller with API clients and caching.
 
         Args:
-            cache_dir: Base directory for SQLite cache
             cache_config: Cache configuration (CacheConfig object)
             rate_limit_config: Rate limiting configuration (RateLimitConfig object)
             retry_config: Retry behavior configuration (RetryConfig object)
@@ -148,11 +143,13 @@ class Caller:
                 api_key=self.api_key
             )
         
+        assert self.api_key is not None
+        
         self.cache_config = cache_config or CacheConfig()
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
         self.retry_config = retry_config or RetryConfig()
 
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(self.cache_config.base_path)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Each model will have its own database and cache manager
@@ -290,13 +287,15 @@ class Caller:
             if config.reasoning is None:
                 to_pass_reasoning = {"reasoning": OPENAI_OMIT}
             else:
-                config.reasoning.pop("max_tokens", None)
-                to_pass_reasoning = {"reasoning_effort": config.reasoning.get("effort")}
+                to_pass_reasoning = {"reasoning": config.reasoning}
+                assert ("max_tokens" in config.reasoning) ^ ("effort" in config.reasoning)
         else:
             to_pass_reasoning = {}
 
-        # Provider-specific routing
+        # Provider-specific routing (to avoid unreliable providers)
+        # You can add more here
         to_pass_extra_body = config.extra_body or {}
+        to_pass_extra_body.update(to_pass_reasoning)
         if config.model == "meta-llama/llama-3.1-8b-instruct":
             to_pass_extra_body = {
                 "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"]}
@@ -310,7 +309,7 @@ class Caller:
 
         create_kwargs = {
             "model": config.model,
-            "messages": [msg.to_openai_content() for msg in messages.messages],
+            "messages": messages.to_openai_messages(),
         }
 
         if config.max_tokens is not None:
@@ -327,8 +326,6 @@ class Caller:
             create_kwargs["tools"] = tool_args.tools
         if to_pass_extra_body:
             create_kwargs["extra_body"] = to_pass_extra_body
-        if to_pass_reasoning:
-            create_kwargs.update(to_pass_reasoning)
 
         try:
             chat_completion = await self.client.chat.completions.create(**create_kwargs)
@@ -338,9 +335,6 @@ class Caller:
             raise
 
         response = OpenaiResponse.model_validate(chat_completion.model_dump())
-
-        # OpenRouter doesn't have rate limit headers, so no update needed
-
         return response
 
     async def _call_anthropic(
@@ -488,6 +482,7 @@ class Caller:
         max_parallel: int,
         model: str | None = None,
         desc: str = "",  # Description for tqdm
+        disable_cache: bool = False,
         **kwargs
     ) -> list[OpenaiResponse]:
         """
@@ -525,7 +520,7 @@ class Caller:
                 raise ValueError("model parameter is required when passing a list of messages")
 
             requests = [
-                {"messages": msg, "model": model, **kwargs}
+                {"messages": msg, "model": model, "disable_cache": disable_cache, **kwargs}
                 for msg in messages
             ]
 
