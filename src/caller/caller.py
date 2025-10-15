@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence, Literal
 from json import JSONDecodeError
+import httpx
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
@@ -19,8 +20,6 @@ import anthropic
 from openai import AsyncOpenAI
 from openai._types import omit as OPENAI_OMIT
 from anthropic import AsyncAnthropic
-from anthropic.types.message import Message
-from anthropic._types import omit as ANTHROPIC_OMIT
 
 from caller.types import (
     ChatMessage,
@@ -124,7 +123,7 @@ class Caller:
             retry_config: Retry behavior configuration (RetryConfig object)
         """
         load_dotenv(dotenv_path)
-        self.provider = provider
+        self._provider = provider
 
         if provider == "openrouter":
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
@@ -152,21 +151,67 @@ class Caller:
         self.cache_dir = Path(self.cache_config.base_path)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Each model will have its own database and cache manager
+        # Each model will have its own database and chunk manager
         self.model_caches: dict[str, Cache] = {}
 
         self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
 
 
-    def _get_cache(self, model: str) -> Cache:
-        """Get or create cache for a model. Each model gets its own database file."""
-        if model not in self.model_caches:
-            self.model_caches[model] = Cache(
-                model_name=model,
-                response_type=OpenaiResponse,
-                cache_config=self.cache_config,
-            )
-        return self.model_caches[model]
+    async def call(
+        self,
+        messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
+        max_parallel: int,
+        model: str | None = None,
+        desc: str = "",  # Description for tqdm
+        disable_cache: bool = False,
+        **kwargs
+    ) -> list[OpenaiResponse]:
+        """
+        Make multiple async API calls in parallel.
+
+        Two usage modes:
+        1. List of messages with shared parameters:
+           call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
+
+        2. List of request dicts with individual parameters:
+           call([
+               {"messages": "Hi", "model": "gpt-4", "max_tokens": 10},
+               {"messages": "Hello", "model": "claude", "max_tokens": 20}
+           ])
+
+        Args:
+            messages: Either a list of message inputs OR a list of request dicts
+            model: Model name (required if using mode 1)
+            max_parallel: Maximum number of parallel requests
+            **kwargs: Additional parameters to apply to all requests (mode 1 only)
+
+        Returns:
+            List of OpenaiResponse objects
+        """
+        if not messages:
+            return []
+
+        # Determine which mode we're in
+        if isinstance(messages[0], dict):
+            # Mode 2: List of request dicts
+            requests = messages
+        else:
+            # Mode 1: List of messages with shared parameters
+            if model is None:
+                raise ValueError("model parameter is required when passing a list of messages")
+
+            requests = [
+                {"messages": msg, "model": model, "disable_cache": disable_cache, **kwargs}
+                for msg in messages
+            ]
+
+        responses = await Slist(requests).par_map_async(
+            func=lambda req: self.call_one(**req),
+            max_par=max_parallel,
+            tqdm=desc != "",
+            desc=desc,
+        )
+        return list(responses)
 
 
     async def call_one(
@@ -213,7 +258,7 @@ class Caller:
                 logger.debug(f"Cache hit for model {model}")
                 return cached_response
 
-        await self.rate_limiter.wait_if_needed(model, self.provider)
+        await self.rate_limiter.wait_if_needed(model, self._provider)
 
         response = await self._call_with_retry(
             messages, config, tool_args
@@ -240,20 +285,18 @@ class Caller:
         Make API call with automatic retry on transient errors.
         Uses exponential backoff configured via retry_config.
         """
-        last_exception = None
         wait_time = self.retry_config.min_wait_seconds
 
         for attempt in range(self.retry_config.max_attempts):
             try:
-                if self.provider == "openrouter":
+                if self._provider == "openrouter":
                     return await self._call_openrouter(messages, config, tool_args)
-                elif self.provider == "anthropic":
+                elif self._provider == "anthropic":
                     return await self._call_anthropic(messages, config, tool_args)
-                elif self.provider == "openai":
+                elif self._provider == "openai":
                     return await self._call_openai(messages, config, tool_args)
 
             except RETRYABLE_EXCEPTIONS as e:
-                last_exception = e
                 if attempt < self.retry_config.max_attempts - 1:
                     logger.warning(
                         f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
@@ -268,11 +311,6 @@ class Caller:
                     logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
                     raise
 
-        # Should never reach here, but just in case
-        if last_exception:
-            raise last_exception
-        raise RuntimeError("Unexpected: retry loop completed without success or exception")
-
     async def _call_openrouter(
         self,
         messages: ChatHistory,
@@ -280,7 +318,7 @@ class Caller:
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
         """Call OpenRouter API."""
-        assert self.provider == "openrouter"
+        assert self._provider == "openrouter"
 
         # Handle thinking models
         if is_thinking_model(config.model):
@@ -343,8 +381,8 @@ class Caller:
         config: InferenceConfig,
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
-        """Call Anthropic API directly."""
-        assert self.provider == "anthropic"
+        """Call Anthropic API directly using httpx to get rate limit headers."""
+        assert self._provider == "anthropic"
 
         # Separate system messages
         non_system = [msg for msg in messages.messages if msg.role != "system"]
@@ -353,7 +391,7 @@ class Caller:
         if len(system_msgs) > 1:
             raise ValueError("Anthropic does not support multiple system messages")
 
-        system_content = system_msgs[0].content if system_msgs else ANTHROPIC_OMIT
+        system_content = system_msgs[0].content if system_msgs else None
 
         anthropic_messages = [
             {"role": msg.role, "content": msg.content} for msg in non_system
@@ -367,60 +405,92 @@ class Caller:
             }
             to_pass_temperature = 1.0
         else:
-            to_pass_thinking = ANTHROPIC_OMIT
-            to_pass_temperature = config.temperature if config.temperature is not None else ANTHROPIC_OMIT
+            to_pass_thinking = None
+            to_pass_temperature = config.temperature
 
         if config.max_tokens is None:
             raise ValueError("Anthropic requires max_tokens")
 
         logger.debug(f"Calling Anthropic with model: {config.model}")
 
-        create_kwargs = {
+        # Build request body
+        request_body = {
             "model": config.model,
             "messages": anthropic_messages,
             "max_tokens": config.max_tokens,
         }
 
-        if system_content != ANTHROPIC_OMIT:
-            create_kwargs["system"] = system_content
-        if to_pass_temperature != ANTHROPIC_OMIT:
-            create_kwargs["temperature"] = to_pass_temperature
+        if system_content:
+            request_body["system"] = system_content
+        if to_pass_temperature is not None:
+            request_body["temperature"] = to_pass_temperature
         if config.top_p is not None:
-            create_kwargs["top_p"] = config.top_p
-        if to_pass_thinking != ANTHROPIC_OMIT:
-            create_kwargs["thinking"] = to_pass_thinking
+            request_body["top_p"] = config.top_p
+        if to_pass_thinking:
+            request_body["thinking"] = to_pass_thinking
         if config.extra_body:
-            create_kwargs["extra_body"] = config.extra_body
+            request_body.update(config.extra_body)
 
-        raw_response: Message = await self.client.messages.create(**create_kwargs)
+        # Make direct HTTP request
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
 
-        # Note: The anthropic SDK doesn't expose headers directly on the response object
-        # We'd need to use httpx directly to get headers, which we'll skip for now
-        # self.rate_limiter.update_from_headers(config.model, "anthropic", headers)
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(url, headers=headers, json=request_body, timeout=120.0)
 
-        if raw_response.content[0].type == "thinking":
-            if len(raw_response.content) >= 2:
+                # Parse rate limit headers
+                self.rate_limiter.update_from_headers(config.model, "anthropic", dict(response.headers))
+
+                if response.status_code != 200:
+                    error_data = response.json() if response.text else {}
+                    error_message = error_data.get("error", {}).get("message", response.text)
+
+                    # Map to appropriate exception types
+                    if response.status_code == 429:
+                        raise anthropic.RateLimitError(f"Rate limit exceeded: {error_message}")
+                    elif response.status_code == 500:
+                        raise anthropic.InternalServerError(f"Internal server error: {error_message}")
+                    elif response.status_code == 529:
+                        raise anthropic._exceptions.OverloadedError(f"API overloaded: {error_message}")
+                    else:
+                        raise anthropic.APIError(f"API error ({response.status_code}): {error_message}")
+
+                raw_response = response.json()
+
+            except httpx.TimeoutException:
+                raise anthropic.APITimeoutError("Request timed out")
+            except httpx.ConnectError as e:
+                raise anthropic.APIConnectionError(f"Connection error: {e}")
+
+        # Process response based on content type
+        if raw_response["content"][0]["type"] == "thinking":
+            if len(raw_response["content"]) >= 2:
                 response_content = {
-                    "reasoning": raw_response.content[0].thinking,
-                    "text": raw_response.content[1].text,
+                    "reasoning": raw_response["content"][0]["thinking"],
+                    "text": raw_response["content"][1]["text"],
                 }
             else:
                 response_content = {
-                    "reasoning": raw_response.content[0].thinking,
+                    "reasoning": raw_response["content"][0]["thinking"],
                     "text": "",
                 }
         else:
             response_content = {
-                "text": raw_response.content[0].text,
+                "text": raw_response["content"][0]["text"],
             }
 
         response = OpenaiResponse(
-            id=raw_response.id,
+            id=raw_response["id"],
             choices=[{"message": {"content": response_content, "role": "assistant"}, "finish_reason": "stop"}],
             created=int(datetime.now().timestamp()),
             model=config.model,
             system_fingerprint=None,
-            usage=raw_response.usage.model_dump(),
+            usage=raw_response["usage"],
         )
 
         return response
@@ -431,104 +501,88 @@ class Caller:
         config: InferenceConfig,
         tool_args: ToolArgs | None,
     ) -> OpenaiResponse:
-        """Call OpenAI API directly."""
-        assert self.provider == "openai"
+        """Call OpenAI API directly using httpx to get rate limit headers."""
+        assert self._provider == "openai"
 
         # Handle thinking models
         if is_thinking_model(config.model):
             if config.reasoning is None:
-                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
+                to_pass_reasoning = None
             else:
-                config.reasoning.pop("max_tokens", None)
-                to_pass_reasoning = {"reasoning_effort": config.reasoning.get("effort")}
+                config_reasoning = config.reasoning.copy()
+                config_reasoning.pop("max_tokens", None)
+                to_pass_reasoning = {"reasoning_effort": config_reasoning.get("effort")}
         else:
-            to_pass_reasoning = {}
+            to_pass_reasoning = None
 
         logger.debug(f"Calling OpenAI with model: {config.model}")
 
-        create_kwargs = {
+        # Build request body
+        request_body = {
             "model": config.model,
             "messages": [msg.to_openai_content() for msg in messages.messages],
         }
 
         if config.max_tokens is not None:
-            create_kwargs["max_tokens"] = config.max_tokens
+            request_body["max_tokens"] = config.max_tokens
         if config.temperature is not None:
-            create_kwargs["temperature"] = config.temperature
+            request_body["temperature"] = config.temperature
         if config.top_p is not None:
-            create_kwargs["top_p"] = config.top_p
+            request_body["top_p"] = config.top_p
         if config.frequency_penalty:
-            create_kwargs["frequency_penalty"] = config.frequency_penalty
+            request_body["frequency_penalty"] = config.frequency_penalty
         if config.response_format is not None:
-            create_kwargs["response_format"] = config.response_format
+            request_body["response_format"] = config.response_format
         if tool_args is not None:
-            create_kwargs["tools"] = tool_args.tools
+            request_body["tools"] = tool_args.tools
         if to_pass_reasoning:
-            create_kwargs.update(to_pass_reasoning)
+            request_body.update(to_pass_reasoning)
 
-        chat_completion = await self.client.chat.completions.create(**create_kwargs)
+        # Make direct HTTP request
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
-        response = OpenaiResponse.model_validate(chat_completion.model_dump())
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(url, headers=headers, json=request_body, timeout=120.0)
 
-        # Note: Similar to Anthropic, we'd need httpx to get headers
-        # self.rate_limiter.update_from_headers(config.model, "openai", headers)
+                # Parse rate limit headers
+                self.rate_limiter.update_from_headers(config.model, "openai", dict(response.headers))
+
+                if response.status_code != 200:
+                    error_data = response.json() if response.text else {}
+                    error_message = error_data.get("error", {}).get("message", response.text)
+
+                    # Map to appropriate exception types
+                    if response.status_code == 429:
+                        raise openai.RateLimitError(f"Rate limit exceeded: {error_message}")
+                    elif response.status_code == 500:
+                        raise openai.InternalServerError(f"Internal server error: {error_message}")
+                    elif response.status_code == 408:
+                        raise openai.APITimeoutError(f"Request timeout: {error_message}")
+                    else:
+                        raise openai.APIError(f"API error ({response.status_code}): {error_message}")
+
+                raw_response = response.json()
+
+            except httpx.TimeoutException:
+                raise openai.APITimeoutError("Request timed out")
+            except httpx.ConnectError as e:
+                raise openai.APIConnectionError(f"Connection error: {e}")
+
+        response = OpenaiResponse.model_validate(raw_response)
 
         return response
 
-
-    async def call(
-        self,
-        messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
-        max_parallel: int,
-        model: str | None = None,
-        desc: str = "",  # Description for tqdm
-        disable_cache: bool = False,
-        **kwargs
-    ) -> list[OpenaiResponse]:
-        """
-        Make multiple async API calls in parallel.
-
-        Two usage modes:
-        1. List of messages with shared parameters:
-           call(["Hi", "Hello", "Hey"], model="gpt-4", max_tokens=10)
-
-        2. List of request dicts with individual parameters:
-           call([
-               {"messages": "Hi", "model": "gpt-4", "max_tokens": 10},
-               {"messages": "Hello", "model": "claude", "max_tokens": 20}
-           ])
-
-        Args:
-            messages: Either a list of message inputs OR a list of request dicts
-            model: Model name (required if using mode 1)
-            max_parallel: Maximum number of parallel requests
-            **kwargs: Additional parameters to apply to all requests (mode 1 only)
-
-        Returns:
-            List of OpenaiResponse objects
-        """
-        if not messages:
-            return []
-
-        # Determine which mode we're in
-        if isinstance(messages[0], dict):
-            # Mode 2: List of request dicts
-            requests = messages
-        else:
-            # Mode 1: List of messages with shared parameters
-            if model is None:
-                raise ValueError("model parameter is required when passing a list of messages")
-
-            requests = [
-                {"messages": msg, "model": model, "disable_cache": disable_cache, **kwargs}
-                for msg in messages
-            ]
-
-        responses = await Slist(requests).par_map_async(
-            func=lambda req: self.call_one(**req),
-            max_par=max_parallel,
-            tqdm=desc != "",
-            desc=desc,
-        )
-        return list(responses)
-
+    def _get_cache(self, model: str) -> Cache:
+        """Get or create cache for a model. Each model gets its own database file."""
+        if model not in self.model_caches:
+            self.model_caches[model] = Cache(
+                model_name=model,
+                response_type=OpenaiResponse,
+                cache_config=self.cache_config,
+            )
+        return self.model_caches[model]
