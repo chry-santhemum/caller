@@ -49,7 +49,6 @@ def is_thinking_model(model_name: str) -> bool:
     ]
     for model in THINKING_MODELS:
         if model_name_without_provider.startswith(model):
-            print(f"{model_name} is a thinking model")
             return True
     return False
 
@@ -344,6 +343,10 @@ class Caller:
         elif config.model == "meta-llama/llama-3.1-70b-instruct":
             to_pass_extra_body = {
                 "provider": {"order": ["deepinfra/turbo", "fireworks"]}
+            }
+        elif config.model.startswith("anthropic/"):
+            to_pass_extra_body = {
+                "provider": {"order": ["google-vertex", "anthropic"]}
             }
 
         logger.debug(f"Calling OpenRouter with model: {config.model}")
