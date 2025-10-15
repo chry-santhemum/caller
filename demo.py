@@ -35,11 +35,11 @@ async def basic_usage():
     responses = await caller.call(
         messages=messages,
         max_parallel=128,
-        model="anthropic/claude-sonnet-4.5",
+        model="openai/gpt-5-mini",
         desc="Sending prompts",
         disable_cache=True,
         max_tokens=4096,
-        reasoning={"max_tokens": 3000}
+        reasoning=3000
     )
 
     print("Reasoning content: ", responses[0].reasoning_content)

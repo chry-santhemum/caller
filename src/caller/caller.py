@@ -328,6 +328,8 @@ class Caller:
                 to_pass_reasoning = {"reasoning": {"max_tokens": config.reasoning}}
             elif isinstance(config.reasoning, str):
                 to_pass_reasoning = {"reasoning": {"effort": config.reasoning}}
+            else:
+                raise ValueError(f"Invalid reasoning parameter: {type(config.reasoning)}")
         else:
             to_pass_reasoning = {}
 

@@ -137,7 +137,7 @@ class InferenceConfig(BaseModel):
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     response_format: dict | None = None
-    reasoning: dict | None = None
+    reasoning: str | int | None = None
     extra_body: dict | None = None
 
 
