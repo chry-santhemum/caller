@@ -159,7 +159,7 @@ class Caller:
 
     async def call(
         self,
-        messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
+        messages: Sequence[str | ChatHistory | Sequence[ChatMessage]] | Sequence[dict],
         max_parallel: int,
         desc: str = "",
         model: str | None = None,
