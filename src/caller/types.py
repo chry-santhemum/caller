@@ -132,14 +132,11 @@ class ChatHistory(BaseModel):
 class InferenceConfig(BaseModel):
     model: str
     temperature: float | None = None
-    top_p: float | None = None
     max_tokens: int | None = None
-    max_completion_tokens: int | None = None
+    top_p: float | None = None
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
-    n: int = 1
     response_format: dict | None = None
-    continue_final_message: bool | None = None
     reasoning: dict | None = None
     extra_body: dict | None = None
 

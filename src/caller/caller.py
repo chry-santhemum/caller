@@ -161,9 +161,8 @@ class Caller:
         self,
         messages: list[str | ChatHistory | Sequence[ChatMessage]] | list[dict],
         max_parallel: int,
+        desc: str = "",
         model: str | None = None,
-        desc: str = "",  # Description for tqdm
-        disable_cache: bool = False,
         **kwargs
     ) -> list[OpenaiResponse]:
         """
@@ -181,8 +180,9 @@ class Caller:
 
         Args:
             messages: Either a list of message inputs OR a list of request dicts
-            model: Model name (required if using mode 1)
             max_parallel: Maximum number of parallel requests
+            desc: Description for tqdm
+            model: Model name (required only if using mode 1)
             **kwargs: Additional parameters to apply to all requests (mode 1 only)
 
         Returns:
@@ -201,7 +201,7 @@ class Caller:
                 raise ValueError("model parameter is required when passing a list of messages")
 
             requests = [
-                {"messages": msg, "model": model, "disable_cache": disable_cache, **kwargs}
+                {"messages": msg, "model": model, **kwargs}
                 for msg in messages
             ]
 
@@ -224,7 +224,7 @@ class Caller:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         response_format: dict | None = None,
-        reasoning: dict | None = None,
+        reasoning: str | int | None = None,
         extra_body: dict | None = None,
         tool_args: ToolArgs | None = None,
         disable_cache: bool = False,
@@ -324,9 +324,10 @@ class Caller:
         if is_thinking_model(config.model):
             if config.reasoning is None:
                 to_pass_reasoning = {"reasoning": OPENAI_OMIT}
-            else:
-                to_pass_reasoning = {"reasoning": config.reasoning}
-                assert ("max_tokens" in config.reasoning) ^ ("effort" in config.reasoning)
+            elif isinstance(config.reasoning, int):
+                to_pass_reasoning = {"reasoning": {"max_tokens": config.reasoning}}
+            elif isinstance(config.reasoning, str):
+                to_pass_reasoning = {"reasoning": {"effort": config.reasoning}}
         else:
             to_pass_reasoning = {}
 
@@ -399,9 +400,10 @@ class Caller:
 
         # Handle thinking models
         if config.reasoning is not None and is_thinking_model(config.model):
+            assert isinstance(config.reasoning, int)
             to_pass_thinking = {
                 "type": "enabled",
-                "budget_tokens": config.reasoning["max_tokens"],
+                "budget_tokens": config.reasoning,
             }
             to_pass_temperature = 1.0
         else:
@@ -509,9 +511,8 @@ class Caller:
             if config.reasoning is None:
                 to_pass_reasoning = None
             else:
-                config_reasoning = config.reasoning.copy()
-                config_reasoning.pop("max_tokens", None)
-                to_pass_reasoning = {"reasoning_effort": config_reasoning.get("effort")}
+                assert isinstance(config.reasoning, str)
+                to_pass_reasoning = {"reasoning_effort": config.reasoning}
         else:
             to_pass_reasoning = None
 
