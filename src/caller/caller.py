@@ -587,3 +587,12 @@ class Caller:
         """Close all cache connections."""
         for cache in self.model_caches.values():
             await cache.close()
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - ensures cleanup."""
+        await self.close()
+        return False
