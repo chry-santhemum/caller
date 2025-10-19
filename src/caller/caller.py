@@ -32,6 +32,7 @@ from caller.cache import CacheConfig, Cache
 from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
 
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
