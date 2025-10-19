@@ -288,6 +288,7 @@ class Caller:
         wait_time = self.retry_config.min_wait_seconds
 
         for attempt in range(self.retry_config.max_attempts):
+            logger.debug(f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {config.model}")
             try:
                 if self._provider == "openrouter":
                     return await self._call_openrouter(messages, config, tool_args)
@@ -373,7 +374,9 @@ class Caller:
             create_kwargs["extra_body"] = to_pass_extra_body
 
         try:
+            logger.debug(f"Calling OpenRouter with model: {config.model}")
             chat_completion = await self.client.chat.completions.create(**create_kwargs)
+            logger.debug(f"Got response from OpenRouter for model: {config.model}")
         except Exception as e:
             note = f"Model: {config.model}. Provider: openrouter"
             e.add_note(note)

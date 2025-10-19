@@ -5,6 +5,7 @@ import asyncio
 import time
 from contextlib import contextmanager
 from caller import Caller, CacheConfig
+from caller.types import OpenaiResponse, ChatHistory, InferenceConfig
 
 
 @contextmanager
@@ -70,6 +71,33 @@ async def cache_demo():
         print(f"  Response: {response3.first_response}")
 
 
+async def parallel_hit_stress(num_calls: int = 128) -> None:
+    """
+    Stress test: many parallel calls to the same model.
+    """
+    tasks = []
+    caller = Caller()
+
+    async def make_call():
+        async with caller:
+            response = await caller.call_one(
+                messages="Hello! Can you give me a random joke? Sample a random one from the entire distribution, according to their probabilities.", 
+                model="gpt-5-nano",
+                reasoning="low",
+                max_tokens=2048,
+                disable_cache=True,
+            )
+            print("Got a response")
+            return response
+    
+    for _ in range(num_calls):
+        tasks.append(make_call())
+    
+    return await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
-    asyncio.run(basic_usage())
+    responses = asyncio.run(parallel_hit_stress(num_calls=128))
+    for resp in responses[:10]:
+        print(resp.first_response + "\n")
+
