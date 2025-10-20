@@ -59,6 +59,7 @@ RETRYABLE_EXCEPTIONS = (
     openai.APITimeoutError,
     openai.APIConnectionError,
     openai.InternalServerError,
+    openai.PermissionDeniedError,
     anthropic.RateLimitError,
     anthropic.InternalServerError,
     anthropic._exceptions.OverloadedError,
@@ -349,6 +350,10 @@ class Caller:
         elif config.model.startswith("anthropic/"):
             to_pass_extra_body = {
                 "provider": {"order": ["google-vertex", "anthropic"], 'allow_fallbacks': False}
+            }
+        elif config.model.startswith("gpt-5"):
+            to_pass_extra_body = {
+                "provider": {"order": ["openai"], 'allow_fallbacks': False}
             }
 
         logger.debug(f"Calling OpenRouter with model: {config.model}")
