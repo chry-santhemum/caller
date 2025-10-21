@@ -364,7 +364,7 @@ class Caller:
         }
 
         if config.max_tokens is not None:
-            create_kwargs["max_tokens"] = config.max_tokens
+            create_kwargs["max_completion_tokens"] = config.max_tokens
         if config.temperature is not None:
             create_kwargs["temperature"] = config.temperature
         if config.top_p is not None:
