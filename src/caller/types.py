@@ -1,21 +1,84 @@
-"""LLM types module."""
+"""
+Types for LLM API calls.
 
-from typing import Sequence, Mapping, Any, Literal
+Reference:
+https://openrouter.ai/docs/api-reference/overview
+"""
+
+from typing import Sequence, Any, Literal, Optional, Union
 from pydantic import BaseModel
 
 
 
-class ToolArgs(BaseModel):
-    tools: Sequence[Mapping[Any, Any]]
-    tool_choice: str
+class FunctionDescription(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Any
+
+
+class Tool(BaseModel):
+    type: Literal["function"]
+    function: FunctionDescription
+
+class FunctionName(BaseModel):
+    name: str
+
+class ToolChoiceFunction(BaseModel):
+    type: Literal["function"]
+    function: FunctionName
+
+ToolChoice = Union[Literal["none"], Literal["auto"], ToolChoiceFunction]
+
+
+
+class ResponseFormat(BaseModel):
+    type: Literal["json_schema"]
+    json_schema: dict
+
+
+class InferenceConfig(BaseModel):
+    """
+    All the optional parameters.
+    """
+
+    response_format: Optional[ResponseFormat] = None
+    stop: Optional[list] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+
+    tools: Optional[list[Tool]] = None
+    tool_choice: Optional[ToolChoice] = None
+
+    # Sampling parameters
+    seed: Optional[int] = None
+    top_p: Optional[float] = None  # (0, 1]
+    frequency_penalty: Optional[float] = None  # [-2, 2]
+    presence_penalty: Optional[float] = None  # [-2, 2]
+    repetition_penalty: Optional[float] = None  # (0, 2]
+    min_p: Optional[float] = None  # [0, 1]
+    top_a: Optional[float] = None  # [0, 1]
+    logit_bias: Optional[dict[int, float]] = None
+    top_logprobs: Optional[int] = None
+
+    # Extra body
+    reasoning: Optional[str | int] = None
+    extra_body: Optional[dict] = None
+
+
+
+
+class TextContent(BaseModel):
+    type: Literal["text"]
+    text: str
+
+class ImageContent(BaseModel):
+    type: Literal["image_url"]
+    image_url: str  # URL or base64
 
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
-    # base64
-    image_content: str | None = None
-    image_type: str | None = None  # image/jpeg, or image/png
+    role: Literal["system", "user", "assistant"]
+    content: str | list[TextContent | ImageContent]
 
     def as_text(self) -> str:
         return f"{self.role}:\n{self.content}"
@@ -76,6 +139,22 @@ class ChatMessage(BaseModel):
             }
 
 
+class ToolMessage(BaseModel):
+    role: Literal["tool"]
+    content: str
+    tool_call_id: str
+    name: Optional[str]=None
+
+
+Message = Union[ChatMessage, ToolMessage]
+
+
+class Request(BaseModel):
+    model: str
+    messages: list[Message]
+    config: InferenceConfig
+
+
 class ChatHistory(BaseModel):
     messages: Sequence[ChatMessage] = []
 
@@ -129,36 +208,27 @@ class ChatHistory(BaseModel):
         return None
 
 
-class InferenceConfig(BaseModel):
-    model: str
-    temperature: float | None = None
-    max_tokens: int | None = None
-    top_p: float | None = None
-    response_format: dict | None = None
-    reasoning: str | int | None = None
-    extra_body: dict | None = None
 
-
-class OpenaiResponse(BaseModel):
+class Response(BaseModel):
     """Unified response format for all providers."""
+    id: str
     choices: list[dict]
-    usage: dict
     created: int
     model: str
-    id: str | None = None
-    system_fingerprint: str | None = None
+    system_fingerprint: Optional[str] = None
+    usage: dict
 
     @property
     def first_response(self) -> str:
         try:
             content = self.choices[0]["message"]["content"]
             if content is None:
-                raise ValueError(f"No content found in OpenaiResponse: {self}")
+                raise ValueError(f"No content found in Response: {self}")
             if isinstance(content, dict):
                 content = content.get("text", "")
             return content
         except (TypeError, KeyError, IndexError) as e:
-            raise ValueError(f"No content found in OpenaiResponse: {self}") from e
+            raise ValueError(f"No content found in Response: {self}") from e
 
     @property
     def reasoning_content(self) -> str | None:

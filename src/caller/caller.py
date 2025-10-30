@@ -3,13 +3,15 @@ Unified Caller class for LLM API calls with caching, rate limiting, and retry lo
 """
 import caller.patches
 import os
+import httpx
 import asyncio
 import logging
+import requests
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence, Literal
+from typing import Sequence, Literal, Optional
 from json import JSONDecodeError
-import httpx
+from abc import ABC, abstractmethod
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
@@ -25,8 +27,8 @@ from caller.types import (
     ChatMessage,
     ChatHistory,
     InferenceConfig,
-    ToolArgs,
-    OpenaiResponse,
+    Request,
+    Response,
 )
 from caller.cache import CacheConfig, Cache
 from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
@@ -35,7 +37,6 @@ from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
 logger = logging.getLogger(__name__)
 
 
-# TODO: Find a better way to do this
 def is_thinking_model(model_name: str) -> bool:
     model_name_without_provider = model_name.split("/")[-1]
     THINKING_MODELS = [
@@ -167,7 +168,7 @@ class Caller:
         desc: str = "",
         model: str | None = None,
         **kwargs
-    ) -> list[OpenaiResponse]:
+    ) -> list[Response]:
         """
         Make multiple async API calls in parallel.
 
@@ -189,7 +190,7 @@ class Caller:
             **kwargs: Additional parameters to apply to all requests (mode 1 only)
 
         Returns:
-            List of OpenaiResponse objects
+            List of Response objects
         """
         if not messages:
             return []
@@ -229,7 +230,7 @@ class Caller:
         extra_body: dict | None = None,
         tool_args: ToolArgs | None = None,
         disable_cache: bool = False,
-    ) -> OpenaiResponse:
+    ) -> Response:
         """
         Make a single async API call.
         """
@@ -280,7 +281,7 @@ class Caller:
         messages: ChatHistory,
         config: InferenceConfig,
         tool_args: ToolArgs | None,
-    ) -> OpenaiResponse:
+    ) -> Response:
         """
         Make API call with automatic retry on transient errors.
         Uses exponential backoff configured via retry_config.
@@ -312,89 +313,14 @@ class Caller:
                     logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
                     raise
 
-    async def _call_openrouter(
-        self,
-        messages: ChatHistory,
-        config: InferenceConfig,
-        tool_args: ToolArgs | None,
-    ) -> OpenaiResponse:
-        """Call OpenRouter API."""
-        assert self._provider == "openrouter"
 
-        # Handle thinking models
-        if is_thinking_model(config.model):
-            if config.reasoning is None:
-                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
-            elif isinstance(config.reasoning, int):
-                to_pass_reasoning = {"reasoning": {"max_tokens": config.reasoning}}
-            elif isinstance(config.reasoning, str):
-                to_pass_reasoning = {"reasoning": {"effort": config.reasoning}}
-            else:
-                raise ValueError(f"Invalid reasoning parameter: {type(config.reasoning)}")
-        else:
-            to_pass_reasoning = {}
-
-        # Provider-specific routing (to avoid unreliable providers)
-        # You can add more here
-        to_pass_extra_body = config.extra_body or {}
-        to_pass_extra_body.update(to_pass_reasoning)
-        if config.model == "meta-llama/llama-3.1-8b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"], 'allow_fallbacks': False}
-            }
-        elif config.model == "meta-llama/llama-3.1-70b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["deepinfra/turbo", "fireworks"], 'allow_fallbacks': False}
-            }
-        elif config.model.startswith("anthropic/"):
-            to_pass_extra_body = {
-                "provider": {"order": ["google-vertex", "anthropic"], 'allow_fallbacks': False}
-            }
-        elif config.model.startswith("gpt-5"):
-            to_pass_extra_body = {
-                "provider": {"order": ["openai"], 'allow_fallbacks': False}
-            }
-
-        logger.debug(f"Calling OpenRouter with model: {config.model}")
-
-        create_kwargs = {
-            "model": config.model,
-            "messages": messages.to_openai_messages(),
-        }
-
-        if config.max_tokens is not None:
-            create_kwargs["max_completion_tokens"] = config.max_tokens
-        if config.temperature is not None:
-            create_kwargs["temperature"] = config.temperature
-        if config.top_p is not None:
-            create_kwargs["top_p"] = config.top_p
-        if config.frequency_penalty:
-            create_kwargs["frequency_penalty"] = config.frequency_penalty
-        if config.response_format is not None:
-            create_kwargs["response_format"] = config.response_format
-        if tool_args is not None:
-            create_kwargs["tools"] = tool_args.tools
-        if to_pass_extra_body:
-            create_kwargs["extra_body"] = to_pass_extra_body
-
-        try:
-            logger.debug(f"Calling OpenRouter with model: {config.model}")
-            chat_completion = await self.client.chat.completions.create(**create_kwargs)
-            logger.debug(f"Got response from OpenRouter for model: {config.model}")
-        except Exception as e:
-            note = f"Model: {config.model}. Provider: openrouter"
-            e.add_note(note)
-            raise
-
-        response = OpenaiResponse.model_validate(chat_completion.model_dump())
-        return response
 
     async def _call_anthropic(
         self,
         messages: ChatHistory,
         config: InferenceConfig,
         tool_args: ToolArgs | None,
-    ) -> OpenaiResponse:
+    ) -> Response:
         """Call Anthropic API directly using httpx to get rate limit headers."""
         assert self._provider == "anthropic"
 
@@ -493,7 +419,7 @@ class Caller:
                 "text": raw_response["content"][0]["text"],
             }
 
-        response = OpenaiResponse(
+        response = Response(
             id=raw_response["id"],
             choices=[{"message": {"content": response_content, "role": "assistant"}, "finish_reason": "stop"}],
             created=int(datetime.now().timestamp()),
@@ -509,7 +435,7 @@ class Caller:
         messages: ChatHistory,
         config: InferenceConfig,
         tool_args: ToolArgs | None,
-    ) -> OpenaiResponse:
+    ) -> Response:
         """Call OpenAI API directly using httpx to get rate limit headers."""
         assert self._provider == "openai"
 
@@ -575,7 +501,7 @@ class Caller:
             except httpx.ConnectError as e:
                 raise ValueError(f"Connection error: {e}")
 
-        response = OpenaiResponse.model_validate(raw_response)
+        response = Response.model_validate(raw_response)
 
         return response
 
@@ -585,7 +511,7 @@ class Caller:
             if model not in self.model_caches:
                 self.model_caches[model] = Cache(
                     model_name=model,
-                    response_type=OpenaiResponse,
+                    response_type=Response,
                     cache_config=self.cache_config,
                 )
         return self.model_caches[model]
@@ -602,3 +528,110 @@ class Caller:
         """Cleanup: close all cache connections."""
         await self.close()
         return False
+
+
+class CallerBaseClass(ABC):
+    @abstractmethod
+    async def call(self, request: Request) -> Response:
+        pass
+
+
+
+class OpenRouterCaller(CallerBaseClass):
+
+    def __init__(self, api_key: Optional[str] = None, dotenv_path: Optional[str|Path] = None) -> None:
+        load_dotenv(dotenv_path)
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
+        assert self.api_key is not None, "API key not provided and not found in .env"
+
+    def check_model_support(self, model_name: str, property: str) -> bool:
+        """
+        Check if a models supports various parameters automatically
+        e.g. reasoning, tools, structured responses.
+        """
+        
+        split_model_name = model_name.split("/")
+        assert len(split_model_name) == 2, "Model name must be in the format of author/slug"
+        author, slug = split_model_name
+
+        url = f"https://openrouter.ai/api/v1/parameters/{author}/{slug}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = requests.get(url, headers=headers)
+        
+        assert response.json()["data"]["model"] == model_name, "Model name does not match"
+        return property in response.json()["data"]["supported_parameters"]
+
+    async def call(self, request: Request) -> Response:
+
+        # Handle thinking models
+        if is_thinking_model(config.model):
+            if config.reasoning is None:
+                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
+            elif isinstance(config.reasoning, int):
+                to_pass_reasoning = {"reasoning": {"max_tokens": config.reasoning}}
+            elif isinstance(config.reasoning, str):
+                to_pass_reasoning = {"reasoning": {"effort": config.reasoning}}
+            else:
+                raise ValueError(f"Invalid reasoning parameter: {type(config.reasoning)}")
+        else:
+            to_pass_reasoning = {}
+
+        # Provider-specific routing (to avoid unreliable providers)
+        # You can add more here
+        to_pass_extra_body = config.extra_body or {}
+        to_pass_extra_body.update(to_pass_reasoning)
+        if config.model == "meta-llama/llama-3.1-8b-instruct":
+            to_pass_extra_body = {
+                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"], 'allow_fallbacks': False}
+            }
+        elif config.model == "meta-llama/llama-3.1-70b-instruct":
+            to_pass_extra_body = {
+                "provider": {"order": ["deepinfra/turbo", "fireworks"], 'allow_fallbacks': False}
+            }
+        elif config.model.startswith("anthropic/"):
+            to_pass_extra_body = {
+                "provider": {"order": ["google-vertex", "anthropic"], 'allow_fallbacks': False}
+            }
+        elif config.model.startswith("gpt-5"):
+            to_pass_extra_body = {
+                "provider": {"order": ["openai"], 'allow_fallbacks': False}
+            }
+
+        logger.debug(f"Calling OpenRouter with model: {config.model}")
+
+        create_kwargs = {
+            "model": config.model,
+            "messages": messages.to_openai_messages(),
+        }
+
+        if config.max_tokens is not None:
+            create_kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None:
+            create_kwargs["temperature"] = config.temperature
+        if config.top_p is not None:
+            create_kwargs["top_p"] = config.top_p
+        if config.frequency_penalty:
+            create_kwargs["frequency_penalty"] = config.frequency_penalty
+        if config.response_format is not None:
+            create_kwargs["response_format"] = config.response_format
+        if tool_args is not None:
+            create_kwargs["tools"] = tool_args.tools
+        if to_pass_extra_body:
+            create_kwargs["extra_body"] = to_pass_extra_body
+
+
+        try:
+            logger.debug(f"Calling OpenRouter with model: {config.model}")
+            chat_completion = await self.client.chat.completions.create(**create_kwargs)
+            logger.debug(f"Got response from OpenRouter for model: {config.model}")
+        except Exception as e:
+            note = f"Model: {config.model}. Provider: openrouter"
+            e.add_note(note)
+            raise
+
+        response = Response.model_validate(chat_completion.model_dump())
+        return response
