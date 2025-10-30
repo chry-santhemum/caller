@@ -29,8 +29,7 @@ class RateLimitState(BaseModel):
 class HeaderRateLimiter:
     """
     Rate limiter that uses response headers from APIs.
-    Only applies to Anthropic and OpenAI direct APIs.
-    OpenRouter has no rate limit headers, so we rely on retries.
+    Only applies to Anthropic and OpenAI clients.
     """
 
     def __init__(self, config: RateLimitConfig | None = None):

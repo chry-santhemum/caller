@@ -134,8 +134,6 @@ class InferenceConfig(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     top_p: float | None = None
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
     response_format: dict | None = None
     reasoning: str | int | None = None
     extra_body: dict | None = None

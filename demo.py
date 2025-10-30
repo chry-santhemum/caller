@@ -96,8 +96,17 @@ async def parallel_hit_stress(num_calls: int = 128) -> None:
     return await asyncio.gather(*tasks)
 
 
-if __name__ == "__main__":
-    responses = asyncio.run(parallel_hit_stress(num_calls=128))
-    for resp in responses[:10]:
-        print(resp.first_response + "\n")
+async def test_claude():
+    caller = Caller(provider="anthropic", cache_config=CacheConfig(base_path=None))
+    response = await caller.call_one(
+        messages="Hello! Can you give me 5 jokes? Sample from the full distribution, as well as their probabilities.", 
+        model="claude-sonnet-4-5",
+        reasoning=2000,
+        max_tokens=2048
+    )
+    print("Usage: ", response.usage, "\n\n")
+    print("Reasoning content: ", response.reasoning_content + "\n\n")
+    print(response.first_response)
 
+if __name__ == "__main__":
+    asyncio.run(test_claude())

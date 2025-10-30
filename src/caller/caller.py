@@ -136,26 +136,28 @@ class Caller:
             self.client = AsyncAnthropic(
                 api_key=self.api_key
             )
-        elif provider == "openai":
+        else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY")
             self.client = AsyncOpenAI(
                 api_key=self.api_key
             )
 
-        assert self.api_key is not None
+        assert self.api_key is not None, "API key not provided and not found in .env"
 
         self.cache_config = cache_config or CacheConfig()
         self.rate_limit_config = rate_limit_config or RateLimitConfig()
+        self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
         self.retry_config = retry_config or RetryConfig()
 
-        self.cache_dir = Path(self.cache_config.base_path)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if self.cache_config.base_path is not None:
+            self.cache_dir = Path(self.cache_config.base_path)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Each model will have its own database and chunk manager
-        self.model_caches: dict[str, Cache] = {}
-        self._cache_lock = asyncio.Lock()  # Lock for cache creation
-
-        self.rate_limiter = HeaderRateLimiter(self.rate_limit_config)
+            # Each model will have its own database and chunk manager
+            self.model_caches: dict[str, Cache] = {}
+            self._cache_lock = asyncio.Lock()  # Lock for cache creation
+        else:
+            self.cache_dir = None  # caching disabled
 
 
     async def call(
@@ -222,8 +224,6 @@ class Caller:
         temperature: float | None = None,
         max_tokens: int | None = None,
         top_p: float | None = None,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
         response_format: dict | None = None,
         reasoning: str | int | None = None,
         extra_body: dict | None = None,
@@ -243,14 +243,12 @@ class Caller:
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
             response_format=response_format,
             reasoning=reasoning,
             extra_body=extra_body,
         )
 
-        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models)
+        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
 
         if should_cache:
             cache = await self._get_cache(model)
@@ -266,6 +264,7 @@ class Caller:
         )
 
         if should_cache and response.has_response() and not response.abnormal_finish:
+            assert self.cache_dir is not None
             cache = await self._get_cache(model)
             await cache.put_entry(
                 response=response,

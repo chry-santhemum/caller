@@ -42,7 +42,7 @@ def file_cache_key(
 class CacheConfig(BaseModel):
     """Configuration for cache behavior."""
 
-    base_path: str = ".cache/caller"
+    base_path: str | None = ".cache/caller"  # None = disable caching
 
     # Models to never cache
     no_cache_models: set[str] = set()
