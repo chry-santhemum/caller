@@ -194,14 +194,18 @@ class Request(BaseModel):
 
 
 class NonStreamingChoice(BaseModel):
-    finish_reason: Optional[str]
-    native_finish_reason: Optional[str]
-    message: dict
-    error: Optional[dict]
+    model_config = {"extra": "allow"}
+
+    finish_reason: Optional[str] = None
+    native_finish_reason: Optional[str] = None
+    message: dict[str, Any]
+    error: Optional[dict] = None
 
 
 class Response(BaseModel):
     """Unified response format for all providers."""
+    model_config = {"extra": "allow"}
+
     id: str
     choices: list[NonStreamingChoice]
     created: int
@@ -242,7 +246,7 @@ class Response(BaseModel):
             logger.warning(f"No reasoning details found in first choice of Response: {self}")
             return None
 
-        reasoning_details = first_choice.message["reasoning_details"]
+        reasoning_details = first_choice.message["reasoning_details"][0]
         if reasoning_details["type"] == "reasoning.summary":
             return reasoning_details["summary"]
         elif reasoning_details["type"] == "reasoning.text":

@@ -52,17 +52,17 @@ async def cache_demo():
 
         print("First call...")
         with timer("API call"):
-            response1 = await caller.call_one(messages=message, model=model, max_tokens=128)
+            response1 = await caller.call_one(messages=message, model=model, max_tokens=1024)
         print(f"  Response: {response1.first_response}")
 
         print("\nSecond call...")
         with timer("Cache hit"):
-            response2 = await caller.call_one(messages=message, model=model, max_tokens=128)
+            response2 = await caller.call_one(messages=message, model=model, max_tokens=1024)
         print(f"  Response: {response2.first_response}")
 
         print("\nThird call...")
         with timer("API call"):
-            response3 = await caller.call_one(messages=message, model=model, max_tokens=128, temperature=0.9)
+            response3 = await caller.call_one(messages=message, model=model, max_tokens=1024, temperature=0.9)
         print(f"  Response: {response3.first_response}")
 
 

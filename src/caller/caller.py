@@ -54,9 +54,6 @@ class RetryConfig(BaseModel):
         anthropic.RateLimitError,
         anthropic.InternalServerError,
         anthropic._exceptions.OverloadedError,
-        ValidationError,
-        JSONDecodeError,
-        ValueError,
     )
 
 
@@ -111,7 +108,7 @@ class CallerBaseClass(ABC):
         self,
         messages: ChatHistory | Sequence[ChatMessage] | str,
         model: str,
-        disable_cache: bool = False,
+        enable_cache: bool = True,
         response_format: Optional[dict] = None,  # pass in the desired json schema
         stop: Optional[list[str]] = None,
         max_tokens: Optional[int] = None,
@@ -158,7 +155,7 @@ class CallerBaseClass(ABC):
             extra_body=extra_body,
         )
 
-        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
+        should_cache = enable_cache and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
 
         if should_cache:
             cache = await self._get_cache(model)
@@ -297,17 +294,20 @@ class OpenRouterCaller(CallerBaseClass):
                 "order": ["anthropic", "google-vertex"],
                 "allow_fallbacks": False,
             })
-        elif request.model.startswith("gpt-5"):
+        elif request.model.startswith("openai"):
             request_body["extra_body"]["provider"].update({
                 "order": ["openai"],
                 "allow_fallbacks": False,
             })
 
+        request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
-            chat_completion = await self.client.chat.completions.create(**request_body)
+            chat_completion = await self.client.chat.completions.create(**request_body_to_pass)
         except Exception as e:
             note = f"Model: {request.model}. OpenRouter API error."
             e.add_note(note)
             raise
+
+        print(chat_completion)
 
         return Response.model_validate(chat_completion.model_dump())
