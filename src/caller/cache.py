@@ -12,7 +12,6 @@ import aiosqlite
 from caller.types import (
     ChatHistory,
     InferenceConfig,
-    ToolArgs,
 )
 
 
@@ -24,15 +23,12 @@ def deterministic_hash(input: str) -> str:
 def file_cache_key(
     messages: ChatHistory,
     config: InferenceConfig,
-    tools: ToolArgs | None,
-    other_info: str = ""
 ) -> tuple[str, str]:
     """Returns: str_key, cache_key"""
     messages_json = messages.model_dump_json(exclude_none=True)
     config_dump = config.model_dump_json(exclude_none=True)
-    tools_json = tools.model_dump_json() if tools is not None else ""
 
-    str_key = messages_json + config_dump + tools_json + other_info
+    str_key = messages_json + config_dump
     cache_key = deterministic_hash(str_key)
 
     return str_key, cache_key
@@ -341,13 +337,11 @@ class Cache(Generic[APIResponse]):
         response: APIResponse,
         messages: ChatHistory,
         config: InferenceConfig,
-        tools: ToolArgs | None,
-        other_info: str = "",
     ) -> None:
         """Store an API call and its response in the cache."""
         await self._ensure_initialized()
 
-        str_key, cache_key = file_cache_key(messages=messages, config=config, tools=tools, other_info=other_info)
+        str_key, cache_key = file_cache_key(messages=messages, config=config)
 
         await self.manager.put_entry(
             cache_key=cache_key,
@@ -359,13 +353,11 @@ class Cache(Generic[APIResponse]):
         self,
         messages: ChatHistory,
         config: InferenceConfig,
-        tools: ToolArgs | None,
-        other_info: str = "",
     ) -> Optional[APIResponse]:
         """Retrieve a cached response for the given inputs, or None if not found."""
         await self._ensure_initialized()
 
-        _, cache_key = file_cache_key(messages=messages, config=config, tools=tools, other_info=other_info)
+        _, cache_key = file_cache_key(messages=messages, config=config)
         response_str = await self.manager.get_entry(cache_key)
 
         if response_str:

@@ -229,6 +229,10 @@ class Response(BaseModel):
         return content
 
     @property
+    def has_response(self) -> bool:
+        return self.first_response is not None
+
+    @property
     def reasoning_content(self) -> str|None:
         """Returns the first response's reasoning content if it exists, otherwise None."""
         first_choice = self.first_choice
