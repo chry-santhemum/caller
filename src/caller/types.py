@@ -3,11 +3,18 @@ Types for LLM API calls.
 
 Reference:
 https://openrouter.ai/docs/api-reference/overview
+
+TODO:
+* Add image support
+* Add streaming support
 """
 
+import logging
 from typing import Sequence, Any, Literal, Optional, Union
 from pydantic import BaseModel
 
+
+logger = logging.getLogger(__name__)
 
 
 class FunctionDescription(BaseModel):
@@ -28,7 +35,6 @@ class ToolChoiceFunction(BaseModel):
     function: FunctionName
 
 ToolChoice = Union[Literal["none"], Literal["auto"], ToolChoiceFunction]
-
 
 
 class ResponseFormat(BaseModel):
@@ -66,77 +72,18 @@ class InferenceConfig(BaseModel):
 
 
 
-
-class TextContent(BaseModel):
-    type: Literal["text"]
-    text: str
-
-class ImageContent(BaseModel):
-    type: Literal["image_url"]
-    image_url: str  # URL or base64
-
-
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str | list[TextContent | ImageContent]
+    content: str
 
     def as_text(self) -> str:
         return f"{self.role}:\n{self.content}"
 
     def to_openai_content(self) -> dict:
-        if not self.image_content:
-            return {
-                "role": self.role,
-                "content": self.content,
-            }
-        else:
-            assert self.image_type, "Please provide an image type"
-            return {
-                "role": self.role,
-                "content": [
-                    {"type": "text", "text": self.content},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{self.image_type};base64,{self.image_content}"
-                        },
-                    },
-                ],
-            }
-
-    def to_anthropic_content(self) -> dict:
-        if not self.image_content:
-            return {
-                "role": self.role,
-                "content": [
-                    {"type": "text", "text": self.content},
-                ],
-            }
-        else:
-            """
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": image1_media_type,
-                    "data": image1_data,
-                },
-            },
-            """
-            return {
-                "role": self.role,
-                "content": [
-                    {"type": "text", "text": self.content},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": self.image_type or "image/jpeg",
-                            "data": self.image_content,
-                        },
-                    },
-                ],
-            }
+        return {
+            "role": self.role,
+            "content": self.content,
+        }
 
 
 class ToolMessage(BaseModel):
@@ -145,18 +92,23 @@ class ToolMessage(BaseModel):
     tool_call_id: str
     name: Optional[str]=None
 
+    def as_text(self) -> str:
+        return f"{self.role}:\n{self.content}"
+
+    def to_openai_content(self) -> dict:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+            "name": self.name,
+        }
+
 
 Message = Union[ChatMessage, ToolMessage]
 
 
-class Request(BaseModel):
-    model: str
-    messages: list[Message]
-    config: InferenceConfig
-
-
 class ChatHistory(BaseModel):
-    messages: Sequence[ChatMessage] = []
+    messages: Sequence[Message] = []
 
     def as_text(self) -> str:
         return "\n".join([msg.as_text() for msg in self.messages])
@@ -174,7 +126,6 @@ class ChatHistory(BaseModel):
         new_messages = []
         for msg in self.messages:
             if msg.role != "system":
-                # Create a copy of the ChatMessage
                 new_messages.append(msg.model_copy())
         assert not any(msg.role == "system" for msg in new_messages)
 
@@ -208,74 +159,107 @@ class ChatHistory(BaseModel):
         return None
 
 
+class Request(BaseModel):
+    """
+    Main request format for OpenRouter.
+    """
+    model: str
+    messages: list[Message] | ChatHistory
+    config: InferenceConfig
+
+    def to_request(self) -> dict:
+        request_body = {"model": self.model}
+        if isinstance(self.messages, ChatHistory):
+            request_body["messages"] = self.messages.to_openai_messages()
+        else:
+            request_body["messages"] = [msg.to_openai_content() for msg in self.messages]
+
+        config_dict = self.config.model_dump()
+
+        if config_dict["reasoning"] is None:
+            pass
+        elif isinstance(config_dict["reasoning"], int):
+            if config_dict["extra_body"] is None:
+                config_dict["extra_body"] = {}
+            config_dict["extra_body"]["reasoning"] = {"max_tokens": config_dict["reasoning"]}
+        elif isinstance(config_dict["reasoning"], str):
+            if config_dict["extra_body"] is None:
+                config_dict["extra_body"] = {}
+            config_dict["extra_body"]["reasoning"] = {"effort": config_dict["reasoning"]}
+
+        config_dict.pop("reasoning")
+
+        request_body.update(config_dict)
+        return request_body
+
+
+class NonStreamingChoice(BaseModel):
+    finish_reason: Optional[str]
+    native_finish_reason: Optional[str]
+    message: dict
+    error: Optional[dict]
+
 
 class Response(BaseModel):
     """Unified response format for all providers."""
     id: str
-    choices: list[dict]
+    choices: list[NonStreamingChoice]
     created: int
     model: str
     system_fingerprint: Optional[str] = None
     usage: dict
 
     @property
-    def first_response(self) -> str:
-        try:
-            content = self.choices[0]["message"]["content"]
-            if content is None:
-                raise ValueError(f"No content found in Response: {self}")
-            if isinstance(content, dict):
-                content = content.get("text", "")
-            return content
-        except (TypeError, KeyError, IndexError) as e:
-            raise ValueError(f"No content found in Response: {self}") from e
+    def first_choice(self) -> NonStreamingChoice|None:
+        """Returns the first choice of the response."""
+        if len(self.choices) == 0:
+            logger.warning(f"No choices found in Response: {self}")
+            return None
+        return self.choices[0]
 
     @property
-    def reasoning_content(self) -> str | None:
-        """Returns the reasoning content if it exists, otherwise None."""
-        try:
-            possible_keys = ["reasoning_content", "reasoning"]
-            for key in possible_keys:
-                if key in self.choices[0]["message"]:
-                    return self.choices[0]["message"][key]
+    def first_response(self) -> str|None:
+        """Returns the first response's content if it exists, otherwise None."""
+        first_choice = self.first_choice
+        if first_choice is None:
+            return None
+        content = first_choice.message["content"]
+        if content is None:
+            logger.warning(f"No content found in first choice of Response: {self}")
+        return content
 
-                content = self.choices[0]["message"].get("content")
-                if isinstance(content, dict) and key in content:
-                    return content[key]
-        except (KeyError, IndexError):
-            pass
-        return None
+    @property
+    def reasoning_content(self) -> str|None:
+        """Returns the first response's reasoning content if it exists, otherwise None."""
+        first_choice = self.first_choice
+        if first_choice is None:
+            return None
+        if "reasoning_details" not in first_choice.message:
+            logger.warning(f"No reasoning details found in first choice of Response: {self}")
+            return None
+
+        reasoning_details = first_choice.message["reasoning_details"]
+        if reasoning_details["type"] == "reasoning.summary":
+            return reasoning_details["summary"]
+        elif reasoning_details["type"] == "reasoning.text":
+            return reasoning_details["text"]
+        elif reasoning_details["type"] == "reasoning.encrypted":
+            logger.info(f"Reasoning details are encrypted in Response: {self}")
+            return reasoning_details["data"]
 
     @property
     def has_reasoning(self) -> bool:
         return self.reasoning_content is not None
 
-    def has_response(self) -> bool:
-        if len(self.choices) == 0:
-            return False
-        first_choice = self.choices[0]
-        if first_choice.get("message") is None:
-            return False
-        if first_choice["message"].get("content") is None:
-            return False
-        return True
-
     @property
-    def hit_content_filter(self) -> bool:
-        """Check if response was blocked by content filter."""
-        try:
-            first_choice = self.choices[0]
-            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
-            return finish_reason == "content_filter"
-        except (KeyError, IndexError):
-            return False
-
-    @property
-    def abnormal_finish(self) -> bool:
-        """Check if response finished abnormally."""
-        try:
-            first_choice = self.choices[0]
-            finish_reason = first_choice.get("finishReason") or first_choice.get("finish_reason")
-            return finish_reason not in ["stop", "length", None]
-        except (KeyError, IndexError):
-            return False
+    def finish_reason(self) -> str|None:
+        """
+        Returns the finish reason of the response.
+        
+        Possible values: "stop", "length", "content_filter", "error", "tool_calls".
+        """
+        first_choice = self.first_choice
+        if first_choice is None:
+            return None
+        finish_reason = first_choice.finish_reason or first_choice.native_finish_reason
+        return finish_reason

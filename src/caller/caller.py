@@ -37,23 +37,6 @@ from caller.rate_limiter import RateLimitConfig, HeaderRateLimiter
 logger = logging.getLogger(__name__)
 
 
-def is_thinking_model(model_name: str) -> bool:
-    model_name_without_provider = model_name.split("/")[-1]
-    THINKING_MODELS = [
-        "claude-opus-4",
-        "claude-sonnet-4",
-        "claude-3-7-sonnet",
-        "gemini-2.5",
-        "gpt-5",
-        "o3",
-        "deepseek-r1",
-    ]
-    for model in THINKING_MODELS:
-        if model_name_without_provider.startswith(model):
-            return True
-    return False
-
-
 # TODO: Some of these probably shouldn't be retried
 RETRYABLE_EXCEPTIONS = (
     openai.RateLimitError,
@@ -217,101 +200,6 @@ class Caller:
         )
         return list(responses)
 
-
-    async def call_one(
-        self,
-        messages: ChatHistory | Sequence[ChatMessage] | str,
-        model: str,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        top_p: float | None = None,
-        response_format: dict | None = None,
-        reasoning: str | int | None = None,
-        extra_body: dict | None = None,
-        tool_args: ToolArgs | None = None,
-        disable_cache: bool = False,
-    ) -> Response:
-        """
-        Make a single async API call.
-        """
-        if isinstance(messages, str):
-            messages = ChatHistory.from_user(messages)
-        elif not isinstance(messages, ChatHistory):
-            messages = ChatHistory(messages=messages)
-
-        config = InferenceConfig(
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            response_format=response_format,
-            reasoning=reasoning,
-            extra_body=extra_body,
-        )
-
-        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
-
-        if should_cache:
-            cache = await self._get_cache(model)
-            cached_response = await cache.get_entry(messages, config, tool_args)
-            if cached_response:
-                logger.debug(f"Cache hit for model {model}")
-                return cached_response
-
-        await self.rate_limiter.wait_if_needed(model, self._provider)
-
-        response = await self._call_with_retry(
-            messages, config, tool_args
-        )
-
-        if should_cache and response.has_response() and not response.abnormal_finish:
-            assert self.cache_dir is not None
-            cache = await self._get_cache(model)
-            await cache.put_entry(
-                response=response,
-                messages=messages,
-                config=config,
-                tools=tool_args,
-            )
-
-        return response
-
-    async def _call_with_retry(
-        self,
-        messages: ChatHistory,
-        config: InferenceConfig,
-        tool_args: ToolArgs | None,
-    ) -> Response:
-        """
-        Make API call with automatic retry on transient errors.
-        Uses exponential backoff configured via retry_config.
-        """
-        wait_time = self.retry_config.min_wait_seconds
-
-        for attempt in range(self.retry_config.max_attempts):
-            logger.debug(f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {config.model}")
-            try:
-                if self._provider == "openrouter":
-                    return await self._call_openrouter(messages, config, tool_args)
-                elif self._provider == "anthropic":
-                    return await self._call_anthropic(messages, config, tool_args)
-                elif self._provider == "openai":
-                    return await self._call_openai(messages, config, tool_args)
-
-            except RETRYABLE_EXCEPTIONS as e:
-                if attempt < self.retry_config.max_attempts - 1:
-                    logger.warning(
-                        f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
-                        f"{type(e).__name__}: {str(e)[:100]}. Waiting {wait_time:.1f}s before retry."
-                    )
-                    await asyncio.sleep(wait_time)
-                    wait_time = min(
-                        wait_time * self.retry_config.exponential_multiplier,
-                        self.retry_config.max_wait_seconds
-                    )
-                else:
-                    logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
-                    raise
 
 
 
@@ -531,10 +419,98 @@ class Caller:
 
 
 class CallerBaseClass(ABC):
+    """
+    Implements calling methods. Holds no state.
+    """
+
     @abstractmethod
-    async def call(self, request: Request) -> Response:
+    async def _call(self, request: Request) -> Response:
         pass
 
+    async def _call_with_retry(self, request: Request, retry_config: RetryConfig) -> Response:
+        """
+        Wraps _call() with automatic retry on transient errors.
+        Uses exponential backoff configured via retry_config.
+        """
+        wait_time = retry_config.min_wait_seconds
+
+        for attempt in range(self.retry_config.max_attempts):
+            logger.debug(f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {retry_config.model}")
+            try:
+                return await self._call(request)
+
+            except RETRYABLE_EXCEPTIONS as e:
+                if attempt < self.retry_config.max_attempts - 1:
+                    logger.warning(
+                        f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
+                        f"{type(e).__name__}: {str(e)[:100]}. Waiting {wait_time:.1f}s before retry."
+                    )
+                    await asyncio.sleep(wait_time)
+                    wait_time = min(
+                        wait_time * self.retry_config.exponential_multiplier,
+                        self.retry_config.max_wait_seconds
+                    )
+                else:
+                    logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
+                    raise
+
+    async def call_one(
+        self,
+        messages: ChatHistory | Sequence[ChatMessage] | str,
+        model: str,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        response_format: dict | None = None,
+        reasoning: str | int | None = None,
+        extra_body: dict | None = None,
+        tool_args: ToolArgs | None = None,
+        disable_cache: bool = False,
+    ) -> Response:
+        """
+        Make a single async API call.
+        """
+        if isinstance(messages, str):
+            messages = ChatHistory.from_user(messages)
+        elif not isinstance(messages, ChatHistory):
+            messages = ChatHistory(messages=messages)
+
+        config = InferenceConfig(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            response_format=response_format,
+            reasoning=reasoning,
+            extra_body=extra_body,
+        )
+
+        should_cache = (not disable_cache) and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
+
+        if should_cache:
+            cache = await self._get_cache(model)
+            cached_response = await cache.get_entry(messages, config, tool_args)
+            if cached_response:
+                logger.debug(f"Cache hit for model {model}")
+                return cached_response
+
+        await self.rate_limiter.wait_if_needed(model, self._provider)
+
+        response = await self._call_with_retry(
+            messages, config, tool_args
+        )
+
+        if should_cache and response.has_response() and not response.abnormal_finish:
+            assert self.cache_dir is not None
+            cache = await self._get_cache(model)
+            await cache.put_entry(
+                response=response,
+                messages=messages,
+                config=config,
+                tools=tool_args,
+            )
+
+        return response
 
 
 class OpenRouterCaller(CallerBaseClass):
@@ -548,9 +524,10 @@ class OpenRouterCaller(CallerBaseClass):
         )
         assert self.api_key is not None, "API key not provided and not found in .env"
 
+
     def check_model_support(self, model_name: str, property: str) -> bool:
         """
-        Check if a models supports various parameters automatically
+        Check if a model supports various parameters.
         e.g. reasoning, tools, structured responses.
         """
         
@@ -565,73 +542,40 @@ class OpenRouterCaller(CallerBaseClass):
         assert response.json()["data"]["model"] == model_name, "Model name does not match"
         return property in response.json()["data"]["supported_parameters"]
 
-    async def call(self, request: Request) -> Response:
 
-        # Handle thinking models
-        if is_thinking_model(config.model):
-            if config.reasoning is None:
-                to_pass_reasoning = {"reasoning": OPENAI_OMIT}
-            elif isinstance(config.reasoning, int):
-                to_pass_reasoning = {"reasoning": {"max_tokens": config.reasoning}}
-            elif isinstance(config.reasoning, str):
-                to_pass_reasoning = {"reasoning": {"effort": config.reasoning}}
-            else:
-                raise ValueError(f"Invalid reasoning parameter: {type(config.reasoning)}")
-        else:
-            to_pass_reasoning = {}
+    async def _call(self, request: Request) -> Response:
+        request_body = request.to_request()
+        if request_body["extra_body"] is None:
+            request_body["extra_body"] = {}
+        request_body["extra_body"]["provider"] = {"require_parameters": True}
 
         # Provider-specific routing (to avoid unreliable providers)
-        # You can add more here
-        to_pass_extra_body = config.extra_body or {}
-        to_pass_extra_body.update(to_pass_reasoning)
-        if config.model == "meta-llama/llama-3.1-8b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"], 'allow_fallbacks': False}
-            }
-        elif config.model == "meta-llama/llama-3.1-70b-instruct":
-            to_pass_extra_body = {
-                "provider": {"order": ["deepinfra/turbo", "fireworks"], 'allow_fallbacks': False}
-            }
-        elif config.model.startswith("anthropic/"):
-            to_pass_extra_body = {
-                "provider": {"order": ["google-vertex", "anthropic"], 'allow_fallbacks': False}
-            }
-        elif config.model.startswith("gpt-5"):
-            to_pass_extra_body = {
-                "provider": {"order": ["openai"], 'allow_fallbacks': False}
-            }
-
-        logger.debug(f"Calling OpenRouter with model: {config.model}")
-
-        create_kwargs = {
-            "model": config.model,
-            "messages": messages.to_openai_messages(),
-        }
-
-        if config.max_tokens is not None:
-            create_kwargs["max_tokens"] = config.max_tokens
-        if config.temperature is not None:
-            create_kwargs["temperature"] = config.temperature
-        if config.top_p is not None:
-            create_kwargs["top_p"] = config.top_p
-        if config.frequency_penalty:
-            create_kwargs["frequency_penalty"] = config.frequency_penalty
-        if config.response_format is not None:
-            create_kwargs["response_format"] = config.response_format
-        if tool_args is not None:
-            create_kwargs["tools"] = tool_args.tools
-        if to_pass_extra_body:
-            create_kwargs["extra_body"] = to_pass_extra_body
-
+        if request.model == "meta-llama/llama-3.1-8b-instruct":
+            request_body["extra_body"]["provider"].update({
+                "order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"],
+                "allow_fallbacks": False,
+            })
+        elif request.model == "meta-llama/llama-3.1-70b-instruct":
+            request_body["extra_body"]["provider"].update({
+                "order": ["deepinfra/turbo", "fireworks"],
+                "allow_fallbacks": False,
+            })
+        elif request.model.startswith("anthropic/"):
+            request_body["extra_body"]["provider"].update({
+                "order": ["anthropic", "google-vertex"],
+                "allow_fallbacks": False,
+            })
+        elif request.model.startswith("gpt-5"):
+            request_body["extra_body"]["provider"].update({
+                "order": ["openai"],
+                "allow_fallbacks": False,
+            })
 
         try:
-            logger.debug(f"Calling OpenRouter with model: {config.model}")
-            chat_completion = await self.client.chat.completions.create(**create_kwargs)
-            logger.debug(f"Got response from OpenRouter for model: {config.model}")
+            chat_completion = await self.client.chat.completions.create(**request_body)
         except Exception as e:
-            note = f"Model: {config.model}. Provider: openrouter"
+            note = f"Model: {request.model}. OpenRouter API error."
             e.add_note(note)
             raise
 
-        response = Response.model_validate(chat_completion.model_dump())
-        return response
+        return Response.model_validate(chat_completion.model_dump())
