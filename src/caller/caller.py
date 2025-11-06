@@ -1,6 +1,7 @@
 """
-Unified Caller class for LLM API calls with caching, rate limiting, and retry logic.
+Main Caller class.
 """
+
 import caller.patches
 import os
 import random
@@ -60,7 +61,9 @@ class RetryConfig(BaseModel):
 
 class CallerBaseClass(ABC):
 
-    def __init__(self, cache_config: Optional[CacheConfig] = None, retry_config: Optional[RetryConfig] = None) -> None:
+    def __init__(
+        self, cache_config: Optional[CacheConfig] = None, retry_config: Optional[RetryConfig] = None
+    ) -> None:
         self.cache_config = cache_config or CacheConfig()
         self.retry_config = retry_config or RetryConfig()
 
@@ -68,11 +71,23 @@ class CallerBaseClass(ABC):
             self.cache_dir = Path(self.cache_config.base_path)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-            # Each model will have its own database and chunk manager
-            self.model_caches: dict[str, Cache] = {}
+            # Each model has its own Cache
+            self.model_caches: dict[str, Cache[Response]] = dict()
             self._cache_lock = asyncio.Lock()  # Lock for cache creation
         else:
             self.cache_dir = None  # caching disabled
+
+    async def _get_cache(self, model: str) -> Cache[Response]:
+        """Get or create cache for a model."""
+        async with self._cache_lock:  # Ensure only one cache is created per model
+            if model not in self.model_caches:
+                safe_model_name = model.replace("/", "_")
+                self.model_caches[model] = Cache(
+                    safe_model_name=safe_model_name,
+                    response_type=Response,
+                    cache_config=self.cache_config,
+                )
+        return self.model_caches[model]
 
     @abstractmethod
     async def _call(self, request: Request) -> Response:
@@ -86,7 +101,9 @@ class CallerBaseClass(ABC):
         wait_time = self.retry_config.min_wait_seconds
 
         for attempt in range(self.retry_config.max_attempts):
-            logger.debug(f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {request.model}")
+            logger.debug(
+                f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {request.model}"
+            )
             try:
                 return await self._call(request)
 
@@ -98,8 +115,7 @@ class CallerBaseClass(ABC):
                     )
                     await asyncio.sleep(wait_time + random.uniform(0, 1))
                     wait_time = min(
-                        wait_time * self.retry_config.multiplier,
-                        self.retry_config.max_wait_seconds
+                        wait_time * self.retry_config.multiplier, self.retry_config.max_wait_seconds
                     )
                 else:
                     logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
@@ -138,7 +154,11 @@ class CallerBaseClass(ABC):
             messages = ChatHistory(messages=messages)
 
         config = InferenceConfig(
-            response_format=ResponseFormat(type="json_schema", json_schema=response_format) if response_format is not None else None,
+            response_format=(
+                ResponseFormat(type="json_schema", json_schema=response_format)
+                if response_format is not None
+                else None
+            ),
             stop=stop,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -158,11 +178,15 @@ class CallerBaseClass(ABC):
             extra_body=extra_body,
         )
 
-        should_cache = enable_cache and (model not in self.cache_config.no_cache_models) and (self.cache_dir is not None)
+        should_cache = (
+            enable_cache
+            and (model not in self.cache_config.no_cache_models)
+            and (self.cache_dir is not None)
+        )
 
         if should_cache:
             cache = await self._get_cache(model)
-            cached_response = await cache.get_entry(messages, config)
+            cached_response = await cache.get_entry(messages=messages, config=config)
             if cached_response:
                 logger.debug(f"Cache hit for model {model}")
                 return cached_response
@@ -179,13 +203,12 @@ class CallerBaseClass(ABC):
             assert self.cache_dir is not None
             cache = await self._get_cache(model)
             await cache.put_entry(
-                response=response,
                 messages=messages,
                 config=config,
+                response=response,
             )
 
         return response
-
 
     async def call(
         self,
@@ -193,7 +216,7 @@ class CallerBaseClass(ABC):
         model: str,
         max_parallel: int,
         desc: str = "",
-        **kwargs
+        **kwargs,
     ) -> list[Response]:
         """
         Make multiple async API calls in parallel.
@@ -202,10 +225,7 @@ class CallerBaseClass(ABC):
         if not messages:
             return []
 
-        tasks = [
-            {"messages": msg, "model": model, **kwargs}
-            for msg in messages
-        ]
+        tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
 
         responses = await Slist(tasks).par_map_async(
             func=lambda task: self.call_one(**task),
@@ -216,55 +236,28 @@ class CallerBaseClass(ABC):
         return list(responses)
 
 
-    async def _get_cache(self, model: str) -> Cache:
-        """Get or create cache for a model. Each model gets its own database file."""
-        async with self._cache_lock:  # Ensure only one cache is created per model
-            if model not in self.model_caches:
-                self.model_caches[model] = Cache(
-                    model_name=model,
-                    response_type=Response,
-                    cache_config=self.cache_config,
-                )
-        return self.model_caches[model]
-
-    async def close(self):
-        """Close all cache connections."""
-        for cache in self.model_caches.values():
-            await cache.close()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
-        return False
-
 
 class OpenRouterCaller(CallerBaseClass):
 
     def __init__(
-        self, 
-        api_key: Optional[str] = None, 
-        dotenv_path: Optional[str|Path] = None,
+        self,
+        api_key: Optional[str] = None,
+        dotenv_path: Optional[str | Path] = None,
         cache_config: Optional[CacheConfig] = None,
-        retry_config: Optional[RetryConfig] = None
+        retry_config: Optional[RetryConfig] = None,
     ):
         super().__init__(cache_config=cache_config, retry_config=retry_config)
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-        self.client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url="https://openrouter.ai/api/v1"
-        )
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
         assert self.api_key is not None, "API key not provided and not found in .env"
-
 
     def check_model_support(self, model_name: str, property: str) -> bool:
         """
         Check if a model supports various parameters.
         e.g. reasoning, tools, structured responses.
         """
-        
+
         split_model_name = model_name.split("/")
         assert len(split_model_name) == 2, "Model name must be in the format of author/slug"
         author, slug = split_model_name
@@ -272,10 +265,9 @@ class OpenRouterCaller(CallerBaseClass):
         url = f"https://openrouter.ai/api/v1/parameters/{author}/{slug}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         response = requests.get(url, headers=headers)
-        
+
         assert response.json()["data"]["model"] == model_name, "Model name does not match"
         return property in response.json()["data"]["supported_parameters"]
-
 
     async def _call(self, request: Request) -> Response:
         request_body = request.to_request()
@@ -285,25 +277,26 @@ class OpenRouterCaller(CallerBaseClass):
 
         # Provider-specific routing (to avoid unreliable providers)
         if request.model == "meta-llama/llama-3.1-8b-instruct":
-            request_body["extra_body"]["provider"].update({
-                "order": ["cerebras/fp16", "novita/fp8", "deepinfra/fp8"],
-                "allow_fallbacks": False,
-            })
-        elif request.model == "meta-llama/llama-3.1-70b-instruct":
-            request_body["extra_body"]["provider"].update({
-                "order": ["deepinfra/turbo", "fireworks"],
-                "allow_fallbacks": False,
-            })
+            request_body["extra_body"]["provider"].update(
+                {
+                    "order": ["novita/fp8", "deepinfra/fp8"],
+                    "allow_fallbacks": False,
+                }
+            )
         elif request.model.startswith("anthropic/"):
-            request_body["extra_body"]["provider"].update({
-                "order": ["anthropic"],
-                "allow_fallbacks": False,
-            })
+            request_body["extra_body"]["provider"].update(
+                {
+                    "order": ["anthropic"],
+                    "allow_fallbacks": False,
+                }
+            )
         elif request.model.startswith("openai"):
-            request_body["extra_body"]["provider"].update({
-                "order": ["openai"],
-                "allow_fallbacks": False,
-            })
+            request_body["extra_body"]["provider"].update(
+                {
+                    "order": ["openai"],
+                    "allow_fallbacks": False,
+                }
+            )
 
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
@@ -312,7 +305,5 @@ class OpenRouterCaller(CallerBaseClass):
             note = f"Model: {request.model}. OpenRouter API error."
             e.add_note(note)
             raise
-
-        # print(chat_completion)
 
         return Response.model_validate(chat_completion.model_dump())

@@ -18,6 +18,7 @@ class RateLimitConfig(BaseModel):
 
 class RateLimitState(BaseModel):
     """Rate limit state parsed from response headers."""
+
     requests_remaining: int | None = None
     requests_reset: datetime | None = None
     tokens_remaining: int | None = None
@@ -58,11 +59,15 @@ class HeaderRateLimiter:
                 return
 
             from datetime import timezone
+
             now = datetime.now(timezone.utc)
             if state.requests_reset and now >= state.requests_reset:
                 return
 
-            if state.requests_remaining is not None and state.requests_remaining < self.config.min_requests_remaining:
+            if (
+                state.requests_remaining is not None
+                and state.requests_remaining < self.config.min_requests_remaining
+            ):
                 if state.requests_reset:
                     wait_time = (state.requests_reset - now).total_seconds()
                     if wait_time > 0:
@@ -73,7 +78,10 @@ class HeaderRateLimiter:
                         )
                         await asyncio.sleep(wait_time)
                         return
-            if state.input_tokens_remaining is not None and state.input_tokens_remaining < self.config.min_tokens_remaining:
+            if (
+                state.input_tokens_remaining is not None
+                and state.input_tokens_remaining < self.config.min_tokens_remaining
+            ):
                 if state.tokens_reset:
                     wait_time = (state.tokens_reset - now).total_seconds()
                     if wait_time > 0:
@@ -107,10 +115,14 @@ class HeaderRateLimiter:
                 )
 
             if "anthropic-ratelimit-input-tokens-remaining" in headers:
-                state.input_tokens_remaining = int(headers["anthropic-ratelimit-input-tokens-remaining"])
+                state.input_tokens_remaining = int(
+                    headers["anthropic-ratelimit-input-tokens-remaining"]
+                )
 
             if "anthropic-ratelimit-output-tokens-remaining" in headers:
-                state.output_tokens_remaining = int(headers["anthropic-ratelimit-output-tokens-remaining"])
+                state.output_tokens_remaining = int(
+                    headers["anthropic-ratelimit-output-tokens-remaining"]
+                )
 
             if "anthropic-ratelimit-tokens-reset" in headers:
                 state.tokens_reset = datetime.fromisoformat(
@@ -151,16 +163,16 @@ class HeaderRateLimiter:
 
         total_seconds = 0
 
-        m_match = re.search(r'(\d+)m', reset_str)
+        m_match = re.search(r"(\d+)m", reset_str)
         if m_match:
             total_seconds += int(m_match.group(1)) * 60
 
         # Don't match milliseconds here
-        s_match = re.search(r'(\d+)s(?!$)', reset_str)
+        s_match = re.search(r"(\d+)s(?!$)", reset_str)
         if s_match:
             total_seconds += int(s_match.group(1))
 
-        ms_match = re.search(r'(\d+)ms', reset_str)
+        ms_match = re.search(r"(\d+)ms", reset_str)
         if ms_match:
             total_seconds += int(ms_match.group(1)) / 1000
 

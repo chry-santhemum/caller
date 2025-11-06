@@ -27,12 +27,15 @@ class Tool(BaseModel):
     type: Literal["function"]
     function: FunctionDescription
 
+
 class FunctionName(BaseModel):
     name: str
+
 
 class ToolChoiceFunction(BaseModel):
     type: Literal["function"]
     function: FunctionName
+
 
 ToolChoice = Union[Literal["none"], Literal["auto"], ToolChoiceFunction]
 
@@ -71,7 +74,6 @@ class InferenceConfig(BaseModel):
     extra_body: Optional[dict] = None
 
 
-
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -90,7 +92,7 @@ class ToolMessage(BaseModel):
     role: Literal["tool"]
     content: str
     tool_call_id: str
-    name: Optional[str]=None
+    name: Optional[str] = None
 
     def as_text(self) -> str:
         return f"{self.role}:\n{self.content}"
@@ -136,9 +138,7 @@ class ChatHistory(BaseModel):
         return ChatHistory(messages=new_messages)
 
     def add_assistant(self, content: str) -> "ChatHistory":
-        new_messages = list(self.messages) + [
-            ChatMessage(role="assistant", content=content)
-        ]
+        new_messages = list(self.messages) + [ChatMessage(role="assistant", content=content)]
         return ChatHistory(messages=new_messages)
 
     def add_messages(self, messages: Sequence[ChatMessage]) -> "ChatHistory":
@@ -163,6 +163,7 @@ class Request(BaseModel):
     """
     Main request format for OpenRouter.
     """
+
     model: str
     messages: list[Message] | ChatHistory
     config: InferenceConfig
@@ -204,6 +205,7 @@ class NonStreamingChoice(BaseModel):
 
 class Response(BaseModel):
     """Unified response format for all providers."""
+
     model_config = {"extra": "allow"}
 
     id: str
@@ -214,7 +216,7 @@ class Response(BaseModel):
     usage: dict
 
     @property
-    def first_choice(self) -> NonStreamingChoice|None:
+    def first_choice(self) -> NonStreamingChoice | None:
         """Returns the first choice of the response."""
         if len(self.choices) == 0:
             logger.warning(f"No choices found in Response: {self}")
@@ -222,7 +224,7 @@ class Response(BaseModel):
         return self.choices[0]
 
     @property
-    def first_response(self) -> str|None:
+    def first_response(self) -> str | None:
         """Returns the first response's content if it exists, otherwise None."""
         first_choice = self.first_choice
         if first_choice is None:
@@ -237,7 +239,7 @@ class Response(BaseModel):
         return self.first_response is not None
 
     @property
-    def reasoning_content(self) -> str|None:
+    def reasoning_content(self) -> str | None:
         """Returns the first response's reasoning content if it exists, otherwise None."""
         first_choice = self.first_choice
         if first_choice is None:
@@ -260,10 +262,10 @@ class Response(BaseModel):
         return self.reasoning_content is not None
 
     @property
-    def finish_reason(self) -> str|None:
+    def finish_reason(self) -> str | None:
         """
         Returns the finish reason of the response.
-        
+
         Possible values: "stop", "length", "content_filter", "error", "tool_calls".
         """
         first_choice = self.first_choice
