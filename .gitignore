@@ -16,3 +16,6 @@ wheels/
 
 # Secrets
 .env
+
+# Trash
+*.log
