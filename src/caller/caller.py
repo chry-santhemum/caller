@@ -3,7 +3,6 @@ Unified Caller class for LLM API calls with caching, rate limiting, and retry lo
 """
 import caller.patches
 import os
-import httpx
 import random
 import asyncio
 import logging
@@ -54,6 +53,8 @@ class RetryConfig(BaseModel):
         anthropic.RateLimitError,
         anthropic.InternalServerError,
         anthropic._exceptions.OverloadedError,
+        JSONDecodeError,
+        ValidationError,
     )
 
 
@@ -124,6 +125,7 @@ class CallerBaseClass(ABC):
         min_p: Optional[float] = None,
         top_a: Optional[float] = None,
         logit_bias: Optional[dict[int, float]] = None,
+        logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
         extra_body: Optional[dict] = None,
     ) -> Response:
@@ -150,6 +152,7 @@ class CallerBaseClass(ABC):
             min_p=min_p,
             top_a=top_a,
             logit_bias=logit_bias,
+            logprobs=logprobs,
             top_logprobs=top_logprobs,
             reasoning=reasoning,
             extra_body=extra_body,
@@ -194,6 +197,7 @@ class CallerBaseClass(ABC):
     ) -> list[Response]:
         """
         Make multiple async API calls in parallel.
+        See call_one for possible kwargs.
         """
         if not messages:
             return []
@@ -210,6 +214,7 @@ class CallerBaseClass(ABC):
             desc=desc,
         )
         return list(responses)
+
 
     async def _get_cache(self, model: str) -> Cache:
         """Get or create cache for a model. Each model gets its own database file."""
@@ -291,7 +296,7 @@ class OpenRouterCaller(CallerBaseClass):
             })
         elif request.model.startswith("anthropic/"):
             request_body["extra_body"]["provider"].update({
-                "order": ["anthropic", "google-vertex"],
+                "order": ["anthropic"],
                 "allow_fallbacks": False,
             })
         elif request.model.startswith("openai"):
@@ -308,6 +313,6 @@ class OpenRouterCaller(CallerBaseClass):
             e.add_note(note)
             raise
 
-        print(chat_completion)
+        # print(chat_completion)
 
         return Response.model_validate(chat_completion.model_dump())
