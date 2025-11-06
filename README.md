@@ -15,6 +15,5 @@ This module was heavily modified from some code initially shared with me by Adam
 ## To do
 
 - Add back OpenAI and Anthropic native support
-- Add configuration for setting max disk cache size
 - Add image support
 - Add streaming response support
