@@ -4,26 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "caller"
-version = "0.6.0"
-description = "A Python library for LLM API calls with caching and rate limiting"
+version = "1.0.0"
+description = "Simple API caller with prompt caching and rate limiting"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Atticus Wang", email = "zifanawang04@gmail.com"}
 ]
-keywords = ["llm", "api", "cache", "rate-limiting", "openai", "anthropic"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-]
-
 dependencies = [
     "aiosqlite>=0.20.0",
     "anthropic>=0.69.0",
