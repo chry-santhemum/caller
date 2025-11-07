@@ -235,7 +235,7 @@ class CallerBaseClass(ABC):
         messages: Sequence[ChatHistory | Sequence[ChatMessage] | str],
         model: str,
         max_parallel: int,
-        desc: str = "",
+        desc: Optional[str] = None,
         **kwargs,
     ) -> list[Response]:
         """
@@ -250,7 +250,7 @@ class CallerBaseClass(ABC):
         responses = await Slist(tasks).par_map_async(
             func=lambda task: self.call_one(**task),
             max_par=max_parallel,
-            tqdm=desc != "",
+            tqdm=desc is not None,
             desc=desc,
         )
         return list(responses)

@@ -14,7 +14,7 @@ async def par_map_async(
     func: Callable[[A], typing.Awaitable[B]],
     max_par: int | None = None,
     tqdm: bool = False,
-    desc: str = "",
+    desc: str|None = None,
 ) -> Slist[B]:
     """Asynchronously apply a function to each element with optional parallelism limit.
 
@@ -42,6 +42,7 @@ async def par_map_async(
     """
     if max_par is None:
         if tqdm:
+            assert desc is not None, "desc must be provided when tqdm is True"
             import tqdm as tqdm_module
 
             tqdm_counter = tqdm_module.tqdm(total=len(self), desc=desc)
@@ -60,6 +61,7 @@ async def par_map_async(
         assert max_par > 0, "max_par must be greater than 0"
         sema = asyncio.Semaphore(max_par)
         if tqdm:
+            assert desc is not None, "desc must be provided when tqdm is True"
             import tqdm as tqdm_module
 
             tqdm_counter = tqdm_module.tqdm(total=len(self), desc=desc)
