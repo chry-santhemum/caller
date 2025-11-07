@@ -105,7 +105,7 @@ class CallerBaseClass(ABC):
     async def _call(self, request: Request) -> Response:
         pass
 
-    async def _call_with_retry(self, request: Request) -> Response:
+    async def _call_with_retry(self, request: Request) -> Response|None:
         """
         Wraps _call() with automatic retry on transient errors.
         Uses jittered exponential backoff configured via retry_config.
@@ -164,7 +164,7 @@ class CallerBaseClass(ABC):
         logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
         extra_body: Optional[dict] = None,
-    ) -> Response:
+    ) -> Response|None:
         """
         Make a single async API call.
         """
@@ -219,7 +219,7 @@ class CallerBaseClass(ABC):
             )
         )
 
-        if should_cache and response.has_response and response.finish_reason == "stop":
+        if should_cache and response is not None and response.has_response and response.finish_reason == "stop":
             assert self.cache_dir is not None
             cache = await self._get_cache(model)
             await cache.put_entry(
@@ -237,7 +237,7 @@ class CallerBaseClass(ABC):
         max_parallel: int,
         desc: Optional[str] = None,
         **kwargs,
-    ) -> list[Response]:
+    ) -> list[Response|None]:
         """
         Make multiple async API calls in parallel.
         See call_one for possible kwargs.
