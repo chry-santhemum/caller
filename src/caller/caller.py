@@ -1,3 +1,4 @@
+
 """
 Main Caller class.
 """
@@ -9,7 +10,7 @@ import asyncio
 import logging
 import requests
 from pathlib import Path
-from typing import Sequence, Literal, Optional
+from typing import Sequence, Literal, Optional, Callable
 from json import JSONDecodeError
 from slist import Slist
 from abc import ABC, abstractmethod
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ValidationError
 import openai
 import anthropic
 from openai import AsyncOpenAI
-from anthropic import AsyncAnthropic
+# from anthropic import AsyncAnthropic
 
 from caller.types import (
     Tool,
@@ -37,6 +38,10 @@ from caller.cache import CacheConfig, Cache
 
 logger = logging.getLogger(__name__)
 
+class CriteriaNotSatisfiedError(Exception):
+    def __init__(self, message: str = "Criteria provided is not satisfied"):
+        super().__init__(message)
+
 
 class RetryConfig(BaseModel):
     """Configuration for retry behavior."""
@@ -45,7 +50,9 @@ class RetryConfig(BaseModel):
     min_wait_seconds: float = 1.0  # Minimum wait time between retries
     max_wait_seconds: float = 30.0  # Maximum wait time between retries
     multiplier: float = 2.0  # Exponential backoff multiplier
-    retryable_exceptions: tuple = (
+
+    criteria: Optional[Callable[[Response], bool]]=None  # criteria that must be satisfied
+    retryable_exceptions: Optional[tuple] = (
         openai.RateLimitError,
         openai.APITimeoutError,
         openai.APIConnectionError,
@@ -56,6 +63,7 @@ class RetryConfig(BaseModel):
         anthropic._exceptions.OverloadedError,
         JSONDecodeError,
         ValidationError,
+        CriteriaNotSatisfiedError,
     )
 
 
@@ -105,9 +113,13 @@ class CallerBaseClass(ABC):
                 f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {request.model}"
             )
             try:
-                return await self._call(request)
+                response = await self._call(request)
+                if self.retry_config.criteria is not None:
+                    if not self.retry_config.criteria(response):
+                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response: {response}")
+                return response
 
-            except self.retry_config.retryable_exceptions as e:
+            except (*self.retry_config.retryable_exceptions, CriteriaNotSatisfiedError) as e:
                 if attempt < self.retry_config.max_attempts - 1:
                     logger.warning(
                         f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
