@@ -46,6 +46,11 @@ class CriteriaNotSatisfiedError(Exception):
 class RetryConfig(BaseModel):
     """Configuration for retry behavior."""
 
+    raise_when_exhausted: bool = True  
+    # raise an exception when all retry attempts are exhausted
+    # the alternate is to return the last response obtained,
+    # or None if all of the errors were API exceptions
+
     max_attempts: int = 8  # Maximum number of retry attempts
     min_wait_seconds: float = 1.0  # Minimum wait time between retries
     max_wait_seconds: float = 30.0  # Maximum wait time between retries
@@ -63,7 +68,6 @@ class RetryConfig(BaseModel):
         anthropic._exceptions.OverloadedError,
         JSONDecodeError,
         ValidationError,
-        CriteriaNotSatisfiedError,
     )
 
 
@@ -112,6 +116,7 @@ class CallerBaseClass(ABC):
             logger.debug(
                 f"Attempt {attempt + 1}/{self.retry_config.max_attempts} to call {request.model}"
             )
+            response = None
             try:
                 response = await self._call(request)
                 if self.retry_config.criteria is not None:
@@ -131,7 +136,10 @@ class CallerBaseClass(ABC):
                     )
                 else:
                     logger.error(f"All {self.retry_config.max_attempts} retry attempts exhausted")
-                    raise
+                    if self.retry_config.raise_when_exhausted:
+                        raise
+                    else:
+                        return response
 
     async def call_one(
         self,
