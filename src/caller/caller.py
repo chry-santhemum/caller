@@ -10,7 +10,7 @@ import asyncio
 import logging
 import requests
 from pathlib import Path
-from typing import Sequence, Literal, Optional, Callable
+from typing import Sequence, Optional, Callable, Type
 from json import JSONDecodeError
 from slist import Slist
 from abc import ABC, abstractmethod
@@ -57,7 +57,7 @@ class RetryConfig(BaseModel):
     multiplier: float = 2.0  # Exponential backoff multiplier
 
     criteria: Optional[Callable[[Response], bool]]=None  # criteria that must be satisfied
-    retryable_exceptions: Optional[tuple] = (
+    retryable_exceptions: tuple[Type[Exception], ...] = (
         openai.RateLimitError,
         openai.APITimeoutError,
         openai.APIConnectionError,
@@ -161,7 +161,6 @@ class CallerBaseClass(ABC):
         min_p: Optional[float] = None,
         top_a: Optional[float] = None,
         logit_bias: Optional[dict[int, float]] = None,
-        logprobs: Optional[bool] = None,
         top_logprobs: Optional[int] = None,
         extra_body: Optional[dict] = None,
     ) -> Response|None:
@@ -192,7 +191,6 @@ class CallerBaseClass(ABC):
             min_p=min_p,
             top_a=top_a,
             logit_bias=logit_bias,
-            logprobs=logprobs,
             top_logprobs=top_logprobs,
             reasoning=reasoning,
             extra_body=extra_body,
@@ -250,8 +248,8 @@ class CallerBaseClass(ABC):
         responses = await Slist(tasks).par_map_async(
             func=lambda task: self.call_one(**task),
             max_par=max_parallel,
-            tqdm=desc is not None,
-            desc=desc,
+            tqdm=(desc is not None),
+            desc=desc,  # type: ignore (patched)
         )
         return list(responses)
 
