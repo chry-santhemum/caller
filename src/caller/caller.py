@@ -325,3 +325,30 @@ class OpenRouterCaller(CallerBaseClass):
             raise
 
         return Response.model_validate(chat_completion.model_dump())
+
+
+class LocalCaller(CallerBaseClass):
+    def __init__(
+        self,
+        base_url: str,
+        cache_config: Optional[CacheConfig] = None,
+        retry_config: Optional[RetryConfig] = None,
+    ):
+        super().__init__(cache_config=cache_config, retry_config=retry_config)
+        self.base_url = base_url
+        self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY")
+
+    async def _call(self, request: Request) -> Response:
+        request_body = request.to_request()
+        request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
+        try:
+            chat_completion = await self.client.chat.completions.create(**request_body_to_pass)
+        except Exception as e:
+            note = f"Model: {request.model}. Local API error."
+            e.add_note(note)
+            raise
+
+        print(chat_completion.model_dump_json())
+        return Response.model_validate(chat_completion.model_dump())
+
+
