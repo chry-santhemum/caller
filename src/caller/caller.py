@@ -5,6 +5,7 @@ Main Caller class.
 
 import caller.patches
 import os
+import json
 import random
 import asyncio
 import logging
@@ -121,7 +122,7 @@ class CallerBaseClass(ABC):
                 response = await self._call(request)
                 if self.retry_config.criteria is not None:
                     if not self.retry_config.criteria(response):
-                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response: {response}")
+                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response:\n{json.dumps(response.__dict__, indent=4)}")
                 return response
 
             except (*self.retry_config.retryable_exceptions, CriteriaNotSatisfiedError) as e:
