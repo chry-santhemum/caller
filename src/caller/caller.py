@@ -298,7 +298,7 @@ class OpenRouterCaller(CallerBaseClass):
         if request.model == "meta-llama/llama-3.1-8b-instruct":
             request_body["extra_body"]["provider"].update(
                 {
-                    "order": ["deepinfra/turbo", "deepinfra/fp8"],
+                    "order": ["novita/fp8"],
                     "allow_fallbacks": False,
                 }
             )
@@ -319,6 +319,7 @@ class OpenRouterCaller(CallerBaseClass):
 
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
+            # logger.info(f"Sent an API call to model: {request.model}")
             chat_completion = await self.client.chat.completions.create(**request_body_to_pass)
         except Exception as e:
             note = f"Model: {request.model}. OpenRouter API error."
