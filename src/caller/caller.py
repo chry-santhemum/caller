@@ -122,14 +122,14 @@ class CallerBaseClass(ABC):
                 response = await self._call(request)
                 if self.retry_config.criteria is not None:
                     if not self.retry_config.criteria(response):
-                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response:\n{json.dumps(response.__dict__, indent=4)}")
+                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response:\n{response.model_dump_json(indent=4)}")
                 return response
 
             except (*self.retry_config.retryable_exceptions, CriteriaNotSatisfiedError) as e:
                 if attempt < self.retry_config.max_attempts - 1:
                     logger.warning(
                         f"Retryable error on attempt {attempt + 1}/{self.retry_config.max_attempts}: "
-                        f"{type(e).__name__}: {str(e)[:100]}. Waiting {wait_time:.1f}s before retry."
+                        f"{type(e).__name__}: {str(e)}. Waiting {wait_time:.1f}s before retry."
                     )
                     await asyncio.sleep(wait_time + random.uniform(0, 1))
                     wait_time = min(
@@ -298,7 +298,7 @@ class OpenRouterCaller(CallerBaseClass):
         if request.model == "meta-llama/llama-3.1-8b-instruct":
             request_body["extra_body"]["provider"].update(
                 {
-                    "order": ["novita/fp8", "deepinfra/fp8"],
+                    "order": ["deepinfra/turbo", "deepinfra/fp8"],
                     "allow_fallbacks": False,
                 }
             )
