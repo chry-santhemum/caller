@@ -1,11 +1,9 @@
-
 """
 Main Caller class.
 """
 
 import caller.patches
 import os
-import json
 import random
 import asyncio
 import logging
@@ -27,6 +25,7 @@ from openai import AsyncOpenAI
 from caller.types import (
     Tool,
     ToolChoice,
+    NonStreamingChoice,
     ResponseFormat,
     ChatMessage,
     ChatHistory,
@@ -122,7 +121,11 @@ class CallerBaseClass(ABC):
                 response = await self._call(request)
                 if self.retry_config.criteria is not None:
                     if not self.retry_config.criteria(response):
-                        raise CriteriaNotSatisfiedError(f"Criteria provided is not satisfied for response:\n{response.model_dump_json(indent=4)}")
+                        raise CriteriaNotSatisfiedError(
+                            f"Criteria provided is not satisfied for response. "
+                            f"Reason: {response.choices[0].finish_reason}"
+                            f"Error: {response.choices[0].error}"
+                        )
                 return response
 
             except (*self.retry_config.retryable_exceptions, CriteriaNotSatisfiedError) as e:
@@ -289,7 +292,7 @@ class OpenRouterCaller(CallerBaseClass):
         return property in response.json()["data"]["supported_parameters"]
 
     async def _call(self, request: Request) -> Response:
-        request_body = request.to_request()
+        request_body = request.to_openrouter_request()
         if request_body["extra_body"] is None:
             request_body["extra_body"] = {}
         request_body["extra_body"]["provider"] = {"require_parameters": True}
@@ -329,6 +332,81 @@ class OpenRouterCaller(CallerBaseClass):
         return Response.model_validate(chat_completion.model_dump())
 
 
+class OpenAICaller(CallerBaseClass):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        dotenv_path: Optional[str | Path] = None,
+        cache_config: Optional[CacheConfig] = None,
+        retry_config: Optional[RetryConfig] = None,
+    ):
+        super().__init__(cache_config=cache_config, retry_config=retry_config)
+        load_dotenv(dotenv_path)
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.client = AsyncOpenAI(api_key=self.api_key)
+        assert self.api_key is not None, "API key not provided and not found in .env"
+
+    @staticmethod
+    def openai_response_to_unified(openai_resp: dict) -> Response:
+        choices = []
+        for idx, output_item in enumerate(openai_resp.get("output", [])):
+            if output_item.get("type") != "message":
+                raise ValueError(f"Unexpected output type: {output_item.get('type')}")
+
+            # Extract the text content from the message
+            content_items = output_item.get("content", [])
+            text = ""
+            for content in content_items:
+                if content.get("type") == "output_text":
+                    text = content.get("text", "")
+                    break  # Use first text content
+            
+            # Normalize to OpenRouter's finish_reason values
+            native_status = output_item.get("status")     
+            finish_reason_map = {
+                "completed": "stop",
+                "incomplete": "length",
+                "failed": "error",
+                "cancelled": "error"
+            }
+            finish_reason = finish_reason_map.get(native_status, "error")
+            
+            choice = NonStreamingChoice(
+                message={
+                    "role": output_item.get("role"),
+                    "content": text
+                },
+                finish_reason=finish_reason,
+                native_finish_reason=native_status,
+                error=openai_resp.get("error")
+            )
+            choices.append(choice)
+        
+        return Response(
+            id=openai_resp["id"],
+            choices=choices,
+            created=openai_resp["created_at"],
+            model=openai_resp["model"],
+            system_fingerprint=openai_resp.get("system_fingerprint"),
+            usage=openai_resp.get("usage", {}),
+            **{k: v for k, v in openai_resp.items() if k not in {"id", "created_at", "model", "output", "usage", "error"}}
+        )
+    
+    
+    async def _call(self, request: Request) -> Response:
+        request_body = request.to_openai_request()
+        request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
+        try:
+            # logger.info(f"Sent an API call to model: {request.model}")
+            response = await self.client.responses.create(**request_body_to_pass)
+        except Exception as e:
+            note = f"Model: {request.model}. OpenAI API error."
+            e.add_note(note)
+            raise
+        
+        return self.openai_response_to_unified(response.model_dump())
+
+
 class LocalCaller(CallerBaseClass):
     def __init__(
         self,
@@ -341,7 +419,7 @@ class LocalCaller(CallerBaseClass):
         self.client = AsyncOpenAI(base_url=base_url, api_key="EMPTY")
 
     async def _call(self, request: Request) -> Response:
-        request_body = request.to_request()
+        request_body = request.to_openrouter_request()
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
             chat_completion = await self.client.chat.completions.create(**request_body_to_pass)
@@ -350,7 +428,7 @@ class LocalCaller(CallerBaseClass):
             e.add_note(note)
             raise
 
-        print(chat_completion.model_dump_json())
+        # print(chat_completion.model_dump_json())
         return Response.model_validate(chat_completion.model_dump())
 
 

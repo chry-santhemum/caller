@@ -169,7 +169,7 @@ class Request(BaseModel):
     messages: list[Message] | ChatHistory
     config: InferenceConfig
 
-    def to_request(self) -> dict:
+    def to_openrouter_request(self) -> dict:
         request_body = {"model": self.model}
         if isinstance(self.messages, ChatHistory):
             request_body["messages"] = self.messages.to_openai_messages()
@@ -190,6 +190,29 @@ class Request(BaseModel):
             config_dict["extra_body"]["reasoning"] = {"effort": config_dict["reasoning"]}
 
         config_dict.pop("reasoning")
+
+        request_body.update(config_dict)
+        return request_body
+
+    def to_openai_request(self) -> dict:
+        request_body = {"model": self.model}
+        if self.model.begins_with("openai/"):
+            print("Please remove the 'openai/' prefix from the model name when using OpenAICaller.")
+            self.model = self.model.removeprefix("openai/")
+
+        if isinstance(self.messages, ChatHistory):
+            request_body["input"] = self.messages.to_openai_messages()
+        else:
+            request_body["input"] = [msg.to_openai_content() for msg in self.messages]
+
+        config_dict = self.config.model_dump()
+        config_dict["max_output_tokens"] = config_dict.pop("max_tokens")
+
+        if config_dict["reasoning"] is None:
+            pass
+        elif isinstance(config_dict["reasoning"], int):
+            logger.warning("Reasoning should be a string, not an integer, for OpenAICaller. Using 'medium' instead.")
+            config_dict["reasoning"] = "medium"
 
         request_body.update(config_dict)
         return request_body
@@ -246,7 +269,7 @@ class Response(BaseModel):
         if first_choice is None:
             return None
         if "reasoning_details" not in first_choice.message:
-            logger.warning(f"No reasoning details found in first choice of Response: {self}")
+            logger.info(f"No reasoning details found in first choice of Response: {self}")
             return None
 
         reasoning_details = first_choice.message["reasoning_details"][0]
@@ -255,7 +278,7 @@ class Response(BaseModel):
         elif reasoning_details["type"] == "reasoning.text":
             return reasoning_details["text"]
         elif reasoning_details["type"] == "reasoning.encrypted":
-            logger.info(f"Reasoning details are encrypted in Response: {self}")
+            logger.debug(f"Reasoning details are encrypted in Response: {self}")
             return reasoning_details["data"]
 
     @property
