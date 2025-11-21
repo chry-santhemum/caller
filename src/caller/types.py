@@ -196,7 +196,7 @@ class Request(BaseModel):
 
     def to_openai_request(self) -> dict:
         request_body = {"model": self.model}
-        if self.model.begins_with("openai/"):
+        if self.model.startswith("openai/"):
             print("Please remove the 'openai/' prefix from the model name when using OpenAICaller.")
             self.model = self.model.removeprefix("openai/")
 
@@ -212,7 +212,9 @@ class Request(BaseModel):
             pass
         elif isinstance(config_dict["reasoning"], int):
             logger.warning("Reasoning should be a string, not an integer, for OpenAICaller. Using 'medium' instead.")
-            config_dict["reasoning"] = "medium"
+            config_dict["reasoning"] = {"effort": "medium"}
+        elif isinstance(config_dict["reasoning"], str):
+            config_dict["reasoning"] = {"effort": config_dict["reasoning"]}
 
         request_body.update(config_dict)
         return request_body

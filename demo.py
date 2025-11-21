@@ -3,7 +3,7 @@ import time
 import random
 import logging
 from contextlib import contextmanager
-from caller import OpenRouterCaller, CacheConfig
+from caller import OpenRouterCaller, OpenAICaller, CacheConfig
 
 cache_config = CacheConfig(
     no_cache_models={
@@ -21,7 +21,9 @@ def timer(description: str = "Operation"):
 
 
 async def basic_usage():
-    caller = OpenRouterCaller()
+    # caller = OpenRouterCaller()
+    caller = OpenAICaller(dotenv_path="/workspace/rm-bias/.env")
+
     messages = [
         "What is the expected number of times do I have to throw a coin before I first get a sequence of HTH?",
         "Hello! Can you give me 5 jokes? Sample from the full distribution, as well as their probabilities.",
@@ -30,13 +32,18 @@ async def basic_usage():
     responses = await caller.call(
         messages=messages,
         max_parallel=128,
-        model="anthropic/claude-sonnet-4.5",
+        model="gpt-5-mini",
         desc="Sending prompts",
         max_tokens=4096,
-        reasoning=3000,
+        reasoning="low",
+        enable_cache=False,
     )
 
     for question, response in zip(messages, responses):
+        if response is None:
+            print(f"Question:\n{question}\n")
+            print("Response: None\n")
+            continue
         print(f"Question:\n{question}\n")
         print(f"Response:\n{response.first_response}\n")
         print(f"Reasoning content:\n{response.reasoning_content}\n")
@@ -101,6 +108,6 @@ if __name__ == "__main__":
     # add logging to a file
     logging.basicConfig(level=logging.INFO, filename="caller.log")
 
-    # asyncio.run(basic_usage())
+    asyncio.run(basic_usage())
     # asyncio.run(cache_demo())
-    asyncio.run(parallel_requests())
+    # asyncio.run(parallel_requests())

@@ -2,6 +2,7 @@
 Main Caller class.
 """
 
+from ast import Continue
 import caller.patches
 import os
 import random
@@ -349,38 +350,54 @@ class OpenAICaller(CallerBaseClass):
     @staticmethod
     def openai_response_to_unified(openai_resp: dict) -> Response:
         choices = []
+        reasoning_details = None
+
         for idx, output_item in enumerate(openai_resp.get("output", [])):
-            if output_item.get("type") != "message":
+            if output_item.get("type") not in ["message", "reasoning"]:
                 raise ValueError(f"Unexpected output type: {output_item.get('type')}")
 
-            # Extract the text content from the message
-            content_items = output_item.get("content", [])
-            text = ""
-            for content in content_items:
-                if content.get("type") == "output_text":
-                    text = content.get("text", "")
-                    break  # Use first text content
-            
-            # Normalize to OpenRouter's finish_reason values
-            native_status = output_item.get("status")     
-            finish_reason_map = {
-                "completed": "stop",
-                "incomplete": "length",
-                "failed": "error",
-                "cancelled": "error"
-            }
-            finish_reason = finish_reason_map.get(native_status, "error")
-            
-            choice = NonStreamingChoice(
-                message={
-                    "role": output_item.get("role"),
-                    "content": text
-                },
-                finish_reason=finish_reason,
-                native_finish_reason=native_status,
-                error=openai_resp.get("error")
-            )
-            choices.append(choice)
+            if output_item.get("type") == "reasoning":
+                output_item["type"] = "reasoning.summary"  # type: ignore
+                if not output_item.get("summary", None):
+                    continue
+                output_item["summary"] = output_item["summary"][0]  # type: ignore
+                if reasoning_details is None:
+                    reasoning_details = []
+                reasoning_details.append(output_item)
+                print(reasoning_details)
+                
+
+            if output_item.get("type") == "message":
+                # Extract the text content from the message
+                content_items = output_item.get("content", [])
+                text = ""
+                for content in content_items:
+                    if content.get("type") == "output_text":
+                        text = content.get("text", "")
+                        break  # Use first text content
+
+                # Normalize to OpenRouter's finish_reason values
+                native_status = output_item.get("status")     
+                finish_reason_map = {
+                    "completed": "stop",
+                    "incomplete": "length",
+                    "failed": "error",
+                    "cancelled": "error"
+                }
+                finish_reason = finish_reason_map.get(native_status, "error")
+                
+                choice = NonStreamingChoice(
+                    message={
+                        "role": output_item.get("role"),
+                        "content": text,
+                    },
+                    finish_reason=finish_reason,
+                    native_finish_reason=native_status,
+                    error=openai_resp.get("error"),
+                )
+                if reasoning_details is not None:
+                    choice.message["reasoning_details"] = reasoning_details
+                choices.append(choice)
         
         return Response(
             id=openai_resp["id"],
@@ -392,7 +409,7 @@ class OpenAICaller(CallerBaseClass):
             **{k: v for k, v in openai_resp.items() if k not in {"id", "created_at", "model", "output", "usage", "error"}}
         )
     
-    
+
     async def _call(self, request: Request) -> Response:
         request_body = request.to_openai_request()
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
