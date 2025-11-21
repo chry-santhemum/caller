@@ -8,12 +8,14 @@ This simple module provides a uniform interface for making API calls to Openrout
 
 See `demo.py` for basic usage.
 
+**WARNING**: The caching logic uses a single DB lock and will slow you down. If you have a lot of async read/writes, you should disable caching!
+
 ## Acknowledgements
 
 This module was heavily modified from some code initially shared with me by Adam Karvonen, who in turn got it from James Chua.
 
 ## To do
 
-- Add back OpenAI and Anthropic native support
+- Add back Anthropic native support
 - Add image support
 - Add streaming response support
