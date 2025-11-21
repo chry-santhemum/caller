@@ -124,7 +124,7 @@ class CallerBaseClass(ABC):
                     if not self.retry_config.criteria(response):
                         raise CriteriaNotSatisfiedError(
                             f"Criteria provided is not satisfied for response. "
-                            f"Reason: {response.choices[0].finish_reason}"
+                            f"Reason: {response.choices[0].finish_reason}; "
                             f"Error: {response.choices[0].error}"
                         )
                 return response
