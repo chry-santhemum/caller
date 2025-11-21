@@ -2,7 +2,6 @@
 Main Caller class.
 """
 
-from ast import Continue
 import caller.patches
 import os
 import random
@@ -126,7 +125,7 @@ class CallerBaseClass(ABC):
                             f"Criteria provided is not satisfied for response. "
                             f"Reason: {response.choices[0].finish_reason}; "
                             f"Error: {response.choices[0].error}"
-                        )
+                        ) 
                 return response
 
             except (*self.retry_config.retryable_exceptions, CriteriaNotSatisfiedError) as e:
