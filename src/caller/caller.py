@@ -4,6 +4,7 @@ Main Caller class.
 
 import caller.patches
 import os
+import time
 import random
 import asyncio
 import logging
@@ -11,8 +12,8 @@ import requests
 from pathlib import Path
 from typing import Sequence, Optional, Callable, Type
 from json import JSONDecodeError
-from slist import Slist
 from abc import ABC, abstractmethod
+from tqdm.asyncio import tqdm_asyncio
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ValidationError
 import openai
 import anthropic
 from openai import AsyncOpenAI
-# from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic
 
 from caller.types import (
     Tool,
@@ -121,10 +122,15 @@ class CallerBaseClass(ABC):
                 response = await self._call(request)
                 if self.retry_config.criteria is not None:
                     if not self.retry_config.criteria(response):
+                        finish_reason = None
+                        error = None
+                        if response.choices and len(response.choices) > 0:
+                            finish_reason = response.choices[0].finish_reason
+                            error = response.choices[0].error
                         raise CriteriaNotSatisfiedError(
                             f"Criteria provided is not satisfied for response. "
-                            f"Reason: {response.choices[0].finish_reason}; "
-                            f"Error: {response.choices[0].error}"
+                            f"Reason: {finish_reason}; "
+                            f"Error: {error}"
                         ) 
                 return response
 
@@ -248,14 +254,14 @@ class CallerBaseClass(ABC):
             return []
 
         tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
+        sem = asyncio.Semaphore(max_parallel)
 
-        responses = await Slist(tasks).par_map_async(
-            func=lambda task: self.call_one(**task),
-            max_par=max_parallel,
-            tqdm=(desc is not None),
-            desc=desc,  # type: ignore (patched)
-        )
-        return list(responses)
+        async def call_one_with_sem(task: dict) -> Response:
+            async with sem:
+                return await self.call_one(**task)
+
+        responses = await tqdm_asyncio.gather(*[call_one_with_sem(task) for task in tasks], desc=desc)
+        return responses
 
 
 
@@ -272,7 +278,7 @@ class OpenRouterCaller(CallerBaseClass):
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.client = AsyncOpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
-        assert self.api_key is not None, "API key not provided and not found in .env"
+        assert self.api_key is not None, "api_key not provided and OPENROUTER_API_KEY not found in .env"
 
     def check_model_support(self, model_name: str, property: str) -> bool:
         """
@@ -344,7 +350,7 @@ class OpenAICaller(CallerBaseClass):
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.client = AsyncOpenAI(api_key=self.api_key)
-        assert self.api_key is not None, "API key not provided and not found in .env"
+        assert self.api_key is not None, "api_key not provided and OPENAI_API_KEY not found in .env"
 
     @staticmethod
     def openai_response_to_unified(openai_resp: dict) -> Response:
@@ -363,7 +369,7 @@ class OpenAICaller(CallerBaseClass):
                 if reasoning_details is None:
                     reasoning_details = []
                 reasoning_details.append(output_item)
-                print(reasoning_details)
+                # print(reasoning_details)
                 
 
             if output_item.get("type") == "message":
@@ -422,6 +428,90 @@ class OpenAICaller(CallerBaseClass):
         
         return self.openai_response_to_unified(response.model_dump())
 
+
+class AnthropicCaller(CallerBaseClass):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        dotenv_path: Optional[str | Path] = None,
+        cache_config: Optional[CacheConfig] = None,
+        retry_config: Optional[RetryConfig] = None,
+    ):
+        super().__init__(cache_config=cache_config, retry_config=retry_config)
+        load_dotenv(dotenv_path)
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.client = AsyncAnthropic(api_key=self.api_key)
+        assert self.api_key is not None, "api_key not provided and ANTHROPIC_API_KEY not found in .env"
+
+    @staticmethod
+    def anthropic_response_to_unified(anthropic_resp: dict) -> Response:
+        choices = []
+        reasoning_details = None
+
+        for idx, output_item in enumerate(anthropic_resp.get("content", [])):
+            if output_item.get("type") not in ["text", "thinking", "redacted_thinking"]:
+                raise ValueError(f"Unexpected output type: {output_item.get('type')}")
+
+            if output_item.get("type") == "thinking":
+                output_item["type"] = "reasoning.summary"  # type: ignore
+                if not output_item.get("thinking", None):
+                    continue
+                output_item["summary"] = output_item["thinking"]  # type: ignore
+                if reasoning_details is None:
+                    reasoning_details = []
+                reasoning_details.append(output_item)
+                # print(reasoning_details)
+                
+            if output_item.get("type") == "text":
+                # Extract the text content from the message
+                text = output_item.get("text", "")
+
+                # Normalize to OpenRouter's finish_reason values
+                finish_reason_map = {
+                    "end_turn": "stop",
+                    "stop_sequence": "stop",
+                    "max_tokens": "length",
+                    "tool_use": "tool_calls",
+                    "refusal": "content_filter",
+                }
+                finish_reason = finish_reason_map.get(anthropic_resp.get("stop_reason", ""), "error")
+                
+                choice = NonStreamingChoice(
+                    message={
+                        "role": anthropic_resp.get("role"),
+                        "content": text,
+                    },
+                    finish_reason=finish_reason,
+                    native_finish_reason=anthropic_resp.get("stop_reason"),
+                    error=None,
+                )
+                if reasoning_details is not None:
+                    choice.message["reasoning_details"] = reasoning_details
+                choices.append(choice)
+        
+        return Response(
+            id=anthropic_resp["id"],
+            choices=choices,
+            created=int(time.time()),  # possibly should default to 0
+            model=anthropic_resp["model"],
+            system_fingerprint=anthropic_resp.get("system_fingerprint"),
+            usage=anthropic_resp.get("usage", {}),
+            **{k: v for k, v in anthropic_resp.items() if k not in {"id", "model", "usage"}}
+        )
+    
+
+    async def _call(self, request: Request) -> Response:
+        request_body = request.to_anthropic_request()
+        request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
+        try:
+            # logger.info(f"Sent an API call to model: {request.model}")
+            response = await self.client.messages.create(**request_body_to_pass)
+        except Exception as e:
+            note = f"Model: {request.model}. Anthropic API error."
+            e.add_note(note)
+            raise
+        
+        return self.anthropic_response_to_unified(response.model_dump())
 
 class LocalCaller(CallerBaseClass):
     def __init__(

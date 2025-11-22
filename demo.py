@@ -3,7 +3,7 @@ import time
 import random
 import logging
 from contextlib import contextmanager
-from caller import OpenRouterCaller, OpenAICaller, CacheConfig
+from caller import OpenRouterCaller, OpenAICaller, AnthropicCaller, CacheConfig
 
 cache_config = CacheConfig(
     no_cache_models={
@@ -22,7 +22,8 @@ def timer(description: str = "Operation"):
 
 async def basic_usage():
     # caller = OpenRouterCaller()
-    caller = OpenAICaller(dotenv_path="/workspace/rm-bias/.env")
+    # caller = OpenAICaller(dotenv_path="/workspace/rm-bias/.env")
+    caller = AnthropicCaller(dotenv_path="/workspace/rm-bias/.env")
 
     messages = [
         "What is the expected number of times do I have to throw a coin before I first get a sequence of HTH?",
@@ -32,10 +33,10 @@ async def basic_usage():
     responses = await caller.call(
         messages=messages,
         max_parallel=128,
-        model="gpt-5-mini",
+        model="claude-sonnet-4-5-20250929",
         desc="Sending prompts",
         max_tokens=4096,
-        reasoning="low",
+        reasoning=2048,
         enable_cache=False,
     )
 

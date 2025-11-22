@@ -16,6 +16,9 @@ This module was heavily modified from some code initially shared with me by Adam
 
 ## To do
 
-- Add back Anthropic native support
-- Add image support
-- Add streaming response support
+- [ ] Ensure correct prefill behavior
+- [x] Add OpenAI native API support
+- [x] Add Anthropic native API support
+- [ ] Implement proper async DB r/w
+- [ ] Add image support
+- [ ] Add streaming response support

@@ -219,6 +219,32 @@ class Request(BaseModel):
         request_body.update(config_dict)
         return request_body
 
+    def to_anthropic_request(self) -> dict:
+        request_body = {"model": self.model}
+        if self.model.startswith("anthropic/"):
+            print("Please remove the 'anthropic/' prefix from the model name when using AnthropicCaller.")
+            self.model = self.model.removeprefix("anthropic/")
+
+        if isinstance(self.messages, ChatHistory):
+            request_body["messages"] = self.messages.to_openai_messages()
+        else:
+            request_body["messages"] = [msg.to_openai_content() for msg in self.messages]
+
+        config_dict = self.config.model_dump()
+
+        if config_dict["reasoning"] is None:
+            config_dict.pop("reasoning")
+            pass
+        elif isinstance(config_dict["reasoning"], int):
+            assert config_dict["max_tokens"] >= 1024, "Max tokens must be at least 1024 for reasoning"
+            config_dict["thinking"] = {"budget_tokens": config_dict.pop("reasoning"), "type": "enabled"}
+        elif isinstance(config_dict["reasoning"], str):
+            config_dict.pop("reasoning")
+            logger.warning("Reasoning should be an integer, not a string, for AnthropicCaller. Defaulting to 1024 thinking tokens instead.")
+            config_dict["thinking"] = {"budget_tokens": 1024, "type": "enabled"}
+
+        request_body.update(config_dict)
+        return request_body   
 
 class NonStreamingChoice(BaseModel):
     model_config = {"extra": "allow"}

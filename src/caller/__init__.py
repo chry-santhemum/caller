@@ -1,5 +1,5 @@
 import importlib.metadata
-from caller.caller import OpenRouterCaller, OpenAICaller, LocalCaller, RetryConfig
+from caller.caller import OpenRouterCaller, OpenAICaller, AnthropicCaller, LocalCaller, RetryConfig
 from caller.cache import CacheConfig
 from caller.types import (
     FunctionDescription,
@@ -24,6 +24,7 @@ except importlib.metadata.PackageNotFoundError:
 __all__ = [
     "OpenRouterCaller",
     "OpenAICaller",
+    "AnthropicCaller",
     "LocalCaller",
     "RetryConfig",
     "CacheConfig",
