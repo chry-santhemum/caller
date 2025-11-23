@@ -1,5 +1,12 @@
 import importlib.metadata
-from caller.caller import OpenRouterCaller, OpenAICaller, AnthropicCaller, LocalCaller, RetryConfig
+from caller.caller import (
+    AutoCaller,
+    OpenRouterCaller,
+    OpenAICaller,
+    AnthropicCaller,
+    LocalCaller,
+    RetryConfig,
+)
 from caller.cache import CacheConfig
 from caller.types import (
     FunctionDescription,
@@ -22,6 +29,7 @@ except importlib.metadata.PackageNotFoundError:
     __version__ = "unknown"
 
 __all__ = [
+    "AutoCaller",
     "OpenRouterCaller",
     "OpenAICaller",
     "AnthropicCaller",

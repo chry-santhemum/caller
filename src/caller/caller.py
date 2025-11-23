@@ -256,7 +256,7 @@ class CallerBaseClass(ABC):
         tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
         sem = asyncio.Semaphore(max_parallel)
 
-        async def call_one_with_sem(task: dict) -> Response:
+        async def call_one_with_sem(task: dict) -> Response|None:
             async with sem:
                 return await self.call_one(**task)
 
@@ -278,7 +278,8 @@ class OpenRouterCaller(CallerBaseClass):
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.client = AsyncOpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
-        assert self.api_key is not None, "api_key not provided and OPENROUTER_API_KEY not found in .env"
+        if self.api_key is None:
+            raise ValueError("api_key not provided and OPENROUTER_API_KEY not found in .env")
 
     def check_model_support(self, model_name: str, property: str) -> bool:
         """
@@ -350,7 +351,8 @@ class OpenAICaller(CallerBaseClass):
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.client = AsyncOpenAI(api_key=self.api_key)
-        assert self.api_key is not None, "api_key not provided and OPENAI_API_KEY not found in .env"
+        if self.api_key is None:
+            raise ValueError("api_key not provided and OPENAI_API_KEY not found in .env")
 
     @staticmethod
     def openai_response_to_unified(openai_resp: dict) -> Response:
@@ -362,16 +364,14 @@ class OpenAICaller(CallerBaseClass):
                 raise ValueError(f"Unexpected output type: {output_item.get('type')}")
 
             if output_item.get("type") == "reasoning":
-                output_item["type"] = "reasoning.summary"  # type: ignore
                 if not output_item.get("summary", None):
                     continue
-                output_item["summary"] = output_item["summary"][0]  # type: ignore
+                output_item["summary"][0]["type"] = "reasoning.text"
                 if reasoning_details is None:
                     reasoning_details = []
-                reasoning_details.append(output_item)
+                reasoning_details.append(output_item["summary"][0])
                 # print(reasoning_details)
                 
-
             if output_item.get("type") == "message":
                 # Extract the text content from the message
                 content_items = output_item.get("content", [])
@@ -441,7 +441,8 @@ class AnthropicCaller(CallerBaseClass):
         load_dotenv(dotenv_path)
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.client = AsyncAnthropic(api_key=self.api_key)
-        assert self.api_key is not None, "api_key not provided and ANTHROPIC_API_KEY not found in .env"
+        if self.api_key is None:
+            raise ValueError("api_key not provided and ANTHROPIC_API_KEY not found in .env")
 
     @staticmethod
     def anthropic_response_to_unified(anthropic_resp: dict) -> Response:
@@ -512,6 +513,98 @@ class AnthropicCaller(CallerBaseClass):
             raise
         
         return self.anthropic_response_to_unified(response.model_dump())
+
+
+class AutoCaller:
+    """
+    Exposes only the call method, which automatically
+    selects the appropriate caller to use.
+    """
+    def __init__(self,
+        dotenv_path: Optional[str | Path] = None,
+        cache_config: Optional[CacheConfig] = None,
+        retry_config: Optional[RetryConfig] = None,
+    ):
+        self.dotenv_path = dotenv_path
+        self.cache_config = cache_config
+        self.retry_config = retry_config
+
+        self.openai_caller = None
+        self.anthropic_caller = None
+        self.openrouter_caller = None
+
+        try:
+            self.openai_caller = OpenAICaller(
+                dotenv_path=self.dotenv_path,
+                cache_config=self.cache_config,
+                retry_config=self.retry_config,
+            )
+        except AssertionError as e:
+            logger.warning("Did not find OPENAI_API_KEY in dotenv_path")
+        
+        try:
+            self.anthropic_caller = AnthropicCaller(
+                dotenv_path=self.dotenv_path,
+                cache_config=self.cache_config,
+                retry_config=self.retry_config,
+            )
+        except AssertionError as e:
+            logger.warning("Did not find ANTHROPIC_API_KEY in dotenv_path")
+        
+        try:
+            self.openrouter_caller = OpenRouterCaller(
+                dotenv_path=self.dotenv_path,
+                cache_config=self.cache_config,
+                retry_config=self.retry_config,
+            )
+        except AssertionError as e:
+            logger.warning("Did not find OPENROUTER_API_KEY in dotenv_path")
+        
+        self.anthropic_model_mapping = {
+            "anthropic/claude-sonnet-4.5": "claude-sonnet-4-5",
+            "anthropic/claude-opus-4.1": "claude-opus-4-1",
+            "anthropic/claude-haiku-4.5": "claude-haiku-4-5",
+            "anthropic/claude-opus-4": "claude-opus-4-20250514",
+            "anthropic/claude-sonnet-4": "claude-sonnet-4-20250514",
+            "anthropic/claude-3.7-sonnet": "claude-3-7-sonnet-20250219",
+            "anthropic/claude-3.5-haiku": "claude-3-5-haiku-20241022",
+            "anthropic/claude-3-haiku": "claude-3-haiku-20240307",
+        }
+
+        
+    async def call(
+        self,
+        messages: Sequence[ChatHistory | Sequence[ChatMessage] | str],
+        model: str,
+        max_parallel: int,
+        desc: Optional[str] = None,
+        **kwargs,
+    ) -> list[Response|None]:
+        if model.startswith("openai/"):
+            # Prioritize using OpenAI native API
+            if self.openai_caller is not None:
+                model_stripped = model.removeprefix("openai/")
+                return await self.openai_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
+            elif self.openrouter_caller is not None:
+                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+
+        elif model.startswith("anthropic/"):
+            if self.anthropic_caller is not None:
+                model_stripped = self.anthropic_model_mapping[model]
+                return await self.anthropic_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
+            elif self.openrouter_caller is not None:
+                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+        
+        else:
+            if self.openrouter_caller is not None:
+                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+
 
 class LocalCaller(CallerBaseClass):
     def __init__(

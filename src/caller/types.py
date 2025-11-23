@@ -212,9 +212,9 @@ class Request(BaseModel):
             pass
         elif isinstance(config_dict["reasoning"], int):
             logger.warning("Reasoning should be a string, not an integer, for OpenAICaller. Using 'medium' instead.")
-            config_dict["reasoning"] = {"effort": "medium"}
+            config_dict["reasoning"] = {"effort": "medium", "summary": "auto"}
         elif isinstance(config_dict["reasoning"], str):
-            config_dict["reasoning"] = {"effort": config_dict["reasoning"]}
+            config_dict["reasoning"] = {"effort": config_dict["reasoning"], "summary": "auto"}
 
         request_body.update(config_dict)
         return request_body
