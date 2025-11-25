@@ -260,7 +260,10 @@ class CallerBaseClass(ABC):
             async with sem:
                 return await self.call_one(**task)
 
-        responses = await tqdm_asyncio.gather(*[call_one_with_sem(task) for task in tasks], desc=desc)
+        if desc is not None:
+            responses = await tqdm_asyncio.gather(*[call_one_with_sem(task) for task in tasks], desc=desc)
+        else:
+            responses = await asyncio.gather(*[call_one_with_sem(task) for task in tasks])
         return responses
 
 
