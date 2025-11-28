@@ -527,41 +527,46 @@ class AutoCaller:
         dotenv_path: Optional[str | Path] = None,
         cache_config: Optional[CacheConfig] = None,
         retry_config: Optional[RetryConfig] = None,
+        force_caller: Optional[str] = None,
     ):
         self.dotenv_path = dotenv_path
         self.cache_config = cache_config
         self.retry_config = retry_config
+        self.force_caller = force_caller
 
         self.openai_caller = None
         self.anthropic_caller = None
         self.openrouter_caller = None
 
-        try:
-            self.openai_caller = OpenAICaller(
-                dotenv_path=self.dotenv_path,
-                cache_config=self.cache_config,
-                retry_config=self.retry_config,
-            )
-        except AssertionError as e:
-            logger.warning("Did not find OPENAI_API_KEY in dotenv_path")
+        if self.force_caller is None or self.force_caller == "openai":
+            try:
+                self.openai_caller = OpenAICaller(
+                    dotenv_path=self.dotenv_path,
+                    cache_config=self.cache_config,
+                    retry_config=self.retry_config,
+                )
+            except AssertionError as e:
+                logger.warning("Did not find OPENAI_API_KEY in dotenv_path")
         
-        try:
-            self.anthropic_caller = AnthropicCaller(
-                dotenv_path=self.dotenv_path,
-                cache_config=self.cache_config,
-                retry_config=self.retry_config,
-            )
-        except AssertionError as e:
-            logger.warning("Did not find ANTHROPIC_API_KEY in dotenv_path")
-        
-        try:
-            self.openrouter_caller = OpenRouterCaller(
-                dotenv_path=self.dotenv_path,
-                cache_config=self.cache_config,
-                retry_config=self.retry_config,
-            )
-        except AssertionError as e:
-            logger.warning("Did not find OPENROUTER_API_KEY in dotenv_path")
+        if self.force_caller is None or self.force_caller == "anthropic":
+            try:
+                self.anthropic_caller = AnthropicCaller(
+                    dotenv_path=self.dotenv_path,
+                    cache_config=self.cache_config,
+                    retry_config=self.retry_config,
+                )
+            except AssertionError as e:
+                logger.warning("Did not find ANTHROPIC_API_KEY in dotenv_path")
+            
+        if self.force_caller is None or self.force_caller == "openrouter":
+            try:
+                self.openrouter_caller = OpenRouterCaller(
+                    dotenv_path=self.dotenv_path,
+                    cache_config=self.cache_config,
+                    retry_config=self.retry_config,
+                )
+            except AssertionError as e:
+                logger.warning("Did not find OPENROUTER_API_KEY in dotenv_path")
         
         self.anthropic_model_mapping = {
             "anthropic/claude-sonnet-4.5": "claude-sonnet-4-5",
