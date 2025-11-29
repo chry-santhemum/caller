@@ -311,7 +311,7 @@ class OpenRouterCaller(CallerBaseClass):
         if request.model == "meta-llama/llama-3.1-8b-instruct":
             request_body["extra_body"]["provider"].update(
                 {
-                    "order": ["novita/fp8"],
+                    "order": ["groq", "deepinfra/turbo", "novita/fp8"],
                     "allow_fallbacks": False,
                 }
             )
