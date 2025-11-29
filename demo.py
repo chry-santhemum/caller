@@ -21,7 +21,7 @@ def timer(description: str = "Operation"):
 
 
 async def basic_usage():
-    caller = AutoCaller(dotenv_path="/workspace/rm-bias/.env")
+    caller = AutoCaller(dotenv_path="/workspace/rm-bias/.env", force_caller="openrouter")
 
     messages = [
         "What is the expected number of times do I have to throw a coin before I first get a sequence of HTH?",
@@ -50,64 +50,31 @@ async def basic_usage():
 
 
 async def cache_demo():
-    caller = OpenRouterCaller()
+    caller = AutoCaller(dotenv_path="/workspace/rm-bias/.env")
     message = "Who is Yo Mama?"
     model = "meta-llama/llama-3.1-70b-instruct"
 
     print("First call...")
     with timer("API call"):
         response1 = await caller.call_one(messages=message, model=model, max_tokens=1024)
-    print(f"  Response: {response1.first_response}")
+    print(f"  Response: {response1.first_response if response1 is not None else 'None'}")
 
     print("\nSecond call...")
     with timer("Cache hit"):
         response2 = await caller.call_one(messages=message, model=model, max_tokens=1024)
-    print(f"  Response: {response2.first_response}")
+    print(f"  Response: {response2.first_response if response2 is not None else 'None'}")
 
     print("\nThird call...")
     with timer("API call"):
         response3 = await caller.call_one(
             messages=message, model=model, max_tokens=1024, temperature=0.9
         )
-    print(f"  Response: {response3.first_response}")
-
-
-async def parallel_requests():
-    # no cache
-    caller = OpenRouterCaller(cache_config=cache_config)
-    messages = ["Please give me a chemical element chosen uniformly at random." for _ in range(1024)]
-    with timer("No cache"):
-        responses = await caller.call(
-            messages=messages,
-            max_parallel=128,
-            model="meta-llama/llama-3.1-8b-instruct",
-            desc="Sending prompts",
-            max_tokens=128,
-            temperature=random.choice([0.6, 0.7, 0.8, 0.9, 1.0])
-        )
-    for response in responses[:1]:
-        print(f"Response: {response.first_response}")
-
-    # with cache
-    caller = OpenRouterCaller()
-    messages = ["Please give me a chemical element chosen uniformly at random." for _ in range(1024)]
-    with timer("With cache"):
-        responses = await caller.call(
-            messages=messages,
-            max_parallel=128,
-            model="meta-llama/llama-3.1-8b-instruct",
-            desc="Sending prompts",
-            max_tokens=128,
-            temperature=random.choice([0.6, 0.7, 0.8, 0.9, 1.0]),
-        )
-    for response in responses[:1]:
-        print(f"Response: {response.first_response}")
+    print(f"  Response: {response3.first_response if response3 is not None else 'None'}")
 
 
 if __name__ == "__main__":
     # add logging to a file
-    logging.basicConfig(level=logging.INFO, filename="caller.log")
+    # logging.basicConfig(level=logging.INFO, filename="caller.log")
 
-    asyncio.run(basic_usage())
-    # asyncio.run(cache_demo())
-    # asyncio.run(parallel_requests())
+    # asyncio.run(basic_usage())
+    asyncio.run(cache_demo())

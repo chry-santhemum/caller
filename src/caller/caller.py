@@ -315,6 +315,13 @@ class OpenRouterCaller(CallerBaseClass):
                     "allow_fallbacks": False,
                 }
             )
+        elif request.model == "meta-llama/llama-3.1-70b-instruct":
+            request_body["extra_body"]["provider"].update(
+                {
+                    "order": ["hyperbolic/fp8", "together/fp8"],
+                    "allow_fallbacks": False,
+                }
+            )
         elif request.model.startswith("anthropic/"):
             request_body["extra_body"]["provider"].update(
                 {
@@ -589,7 +596,6 @@ class AutoCaller:
         **kwargs,
     ) -> list[Response|None]:
         if model.startswith("openai/"):
-            # Prioritize using OpenAI native API
             if self.openai_caller is not None:
                 model_stripped = model.removeprefix("openai/")
                 return await self.openai_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
@@ -610,6 +616,37 @@ class AutoCaller:
         else:
             if self.openrouter_caller is not None:
                 return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+
+
+    async def call_one(
+        self,
+        messages: ChatHistory | Sequence[ChatMessage] | str,
+        model: str,
+        **kwargs,
+    ) -> Response|None:
+        if model.startswith("openai/"):
+            if self.openai_caller is not None:
+                model_stripped = model.removeprefix("openai/")
+                return await self.openai_caller.call_one(messages=messages, model=model_stripped, **kwargs)
+            elif self.openrouter_caller is not None:
+                return await self.openrouter_caller.call_one(messages=messages, model=model, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+
+        elif model.startswith("anthropic/"):
+            if self.anthropic_caller is not None:
+                model_stripped = self.anthropic_model_mapping[model]
+                return await self.anthropic_caller.call_one(messages=messages, model=model_stripped, **kwargs)
+            elif self.openrouter_caller is not None:
+                return await self.openrouter_caller.call_one(messages=messages, model=model, **kwargs)
+            else:
+                raise ValueError(f"No caller was found that supports the given model {model}")
+        
+        else:
+            if self.openrouter_caller is not None:
+                return await self.openrouter_caller.call_one(messages=messages, model=model, **kwargs)
             else:
                 raise ValueError(f"No caller was found that supports the given model {model}")
 
