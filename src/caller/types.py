@@ -10,12 +10,9 @@ TODO:
 * Add streaming support
 """
 
-import logging
+from loguru import logger
 from typing import Sequence, Any, Literal, Optional, Union
 from pydantic import BaseModel
-
-
-logger = logging.getLogger(__name__)
 
 
 class FunctionDescription(BaseModel):

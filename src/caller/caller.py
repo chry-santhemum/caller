@@ -7,9 +7,9 @@ import os
 import time
 import random
 import asyncio
-import logging
 import requests
 from pathlib import Path
+from loguru import logger
 from typing import Sequence, Optional, Callable, Type
 from json import JSONDecodeError
 from abc import ABC, abstractmethod
@@ -22,6 +22,8 @@ import openai
 import anthropic
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
+
+logger.disable("caller")
 
 from caller.types import (
     Tool,
@@ -36,8 +38,6 @@ from caller.types import (
 )
 from caller.cache import CacheConfig, Cache
 
-
-logger = logging.getLogger(__name__)
 
 class CriteriaNotSatisfiedError(Exception):
     def __init__(self, message: str = "Criteria provided is not satisfied"):

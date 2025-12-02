@@ -1,7 +1,5 @@
 import asyncio
 import time
-import random
-import logging
 from contextlib import contextmanager
 from caller import AutoCaller, CacheConfig
 
@@ -73,8 +71,5 @@ async def cache_demo():
 
 
 if __name__ == "__main__":
-    # add logging to a file
-    # logging.basicConfig(level=logging.INFO, filename="caller.log")
-
     # asyncio.run(basic_usage())
     asyncio.run(cache_demo())

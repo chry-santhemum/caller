@@ -4,7 +4,7 @@ import json
 import time
 import hashlib
 import asyncio
-import logging
+from loguru import logger
 from pathlib import Path
 from cachetools import LRUCache
 from collections import OrderedDict
@@ -16,8 +16,6 @@ from caller.types import (
     ChatHistory,
     InferenceConfig,
 )
-
-logger = logging.getLogger(__name__)
 
 APIResponse = TypeVar("APIResponse", bound=BaseModel)
 
