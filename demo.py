@@ -19,7 +19,7 @@ def timer(description: str = "Operation"):
 
 
 async def basic_usage():
-    caller = AutoCaller(dotenv_path="/workspace/rm-bias/.env", force_caller="openrouter")
+    caller = AutoCaller(dotenv_path="/workspace/rm-bias/.env")
 
     messages = [
         "What is the expected number of times do I have to throw a coin before I first get a sequence of HTH?",
@@ -30,9 +30,9 @@ async def basic_usage():
         messages=messages,
         max_parallel=128,
         # model="anthropic/claude-sonnet-4.5",
-        model="openai/gpt-5-mini",
+        model="openai/gpt-5",
         desc="Sending prompts",
-        max_tokens=2048,
+        max_tokens=4096,
         reasoning="low",
         enable_cache=False,
     )
@@ -71,5 +71,5 @@ async def cache_demo():
 
 
 if __name__ == "__main__":
-    # asyncio.run(basic_usage())
-    asyncio.run(cache_demo())
+    asyncio.run(basic_usage())
+    # asyncio.run(cache_demo())

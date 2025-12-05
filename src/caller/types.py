@@ -10,6 +10,7 @@ TODO:
 * Add streaming support
 """
 
+import json
 from loguru import logger
 from typing import Sequence, Any, Literal, Optional, Union
 from pydantic import BaseModel
@@ -145,6 +146,9 @@ class ChatHistory(BaseModel):
 
     def to_openai_messages(self) -> list[dict]:
         return [msg.to_openai_content() for msg in self.messages]
+    
+    def to_openai_str(self) -> str:
+        return json.dumps(self.to_openai_messages(), indent=4)
 
     def get_first(self, role: Literal["system", "user", "assistant"]) -> str | None:
         """
