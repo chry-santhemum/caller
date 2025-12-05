@@ -599,36 +599,25 @@ class AutoCaller:
         desc: Optional[str] = None,
         **kwargs,
     ) -> list[Response|None]:
-        if model.startswith("openai/"):
-            if self.openai_caller is not None:
-                if isinstance(model, str):
-                    model_stripped = model.removeprefix("openai/")
-                else:
-                    model_stripped = [model_name.removeprefix("openai/") for model_name in model]
-                return await self.openai_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
-            elif self.openrouter_caller is not None:
-                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
-            else:
-                raise ValueError(f"No caller was found that supports the given model {model}")
+        if not messages:
+            return []
 
-        elif model.startswith("anthropic/"):
-            if self.anthropic_caller is not None:
-                if isinstance(model, str):
-                    model_stripped = self.anthropic_model_mapping[model]
-                else:
-                    model_stripped = [self.anthropic_model_mapping[model_name] for model_name in model]
-                return await self.anthropic_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
-            elif self.openrouter_caller is not None:
-                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
-            else:
-                raise ValueError(f"No caller was found that supports the given model {model}")
-        
+        if isinstance(model, str):
+            tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
         else:
-            if self.openrouter_caller is not None:
-                return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
-            else:
-                raise ValueError(f"No caller was found that supports the given model {model}")
+            assert len(model) == len(messages), "Number of models must match number of messages"
+            tasks = [{"messages": msg, "model": model_name, **kwargs} for msg, model_name in zip(messages, model)]
+        sem = asyncio.Semaphore(max_parallel)
 
+        async def call_one_with_sem(task: dict) -> Response|None:
+            async with sem:
+                return await self.call_one(**task)
+
+        if desc is not None:
+            responses = await tqdm_asyncio.gather(*[call_one_with_sem(task) for task in tasks], desc=desc)
+        else:
+            responses = await asyncio.gather(*[call_one_with_sem(task) for task in tasks])
+        return responses
 
     async def call_one(
         self,
