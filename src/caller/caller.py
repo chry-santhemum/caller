@@ -241,7 +241,7 @@ class CallerBaseClass(ABC):
     async def call(
         self,
         messages: Sequence[ChatHistory | Sequence[ChatMessage] | str],
-        model: str,
+        model: str | list[str],
         max_parallel: int,
         desc: Optional[str] = None,
         **kwargs,
@@ -253,7 +253,11 @@ class CallerBaseClass(ABC):
         if not messages:
             return []
 
-        tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
+        if isinstance(model, str):
+            tasks = [{"messages": msg, "model": model, **kwargs} for msg in messages]
+        else:
+            assert len(model) == len(messages), "Number of models must match number of messages"
+            tasks = [{"messages": msg, "model": model_name, **kwargs} for msg, model_name in zip(messages, model)]
         sem = asyncio.Semaphore(max_parallel)
 
         async def call_one_with_sem(task: dict) -> Response|None:
@@ -590,14 +594,17 @@ class AutoCaller:
     async def call(
         self,
         messages: Sequence[ChatHistory | Sequence[ChatMessage] | str],
-        model: str,
+        model: str | list[str],
         max_parallel: int,
         desc: Optional[str] = None,
         **kwargs,
     ) -> list[Response|None]:
         if model.startswith("openai/"):
             if self.openai_caller is not None:
-                model_stripped = model.removeprefix("openai/")
+                if isinstance(model, str):
+                    model_stripped = model.removeprefix("openai/")
+                else:
+                    model_stripped = [model_name.removeprefix("openai/") for model_name in model]
                 return await self.openai_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
             elif self.openrouter_caller is not None:
                 return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
@@ -606,7 +613,10 @@ class AutoCaller:
 
         elif model.startswith("anthropic/"):
             if self.anthropic_caller is not None:
-                model_stripped = self.anthropic_model_mapping[model]
+                if isinstance(model, str):
+                    model_stripped = self.anthropic_model_mapping[model]
+                else:
+                    model_stripped = [self.anthropic_model_mapping[model_name] for model_name in model]
                 return await self.anthropic_caller.call(messages=messages, model=model_stripped, max_parallel=max_parallel, desc=desc, **kwargs)
             elif self.openrouter_caller is not None:
                 return await self.openrouter_caller.call(messages=messages, model=model, max_parallel=max_parallel, desc=desc, **kwargs)
