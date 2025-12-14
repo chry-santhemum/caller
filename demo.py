@@ -30,10 +30,10 @@ async def basic_usage():
         messages=messages,
         max_parallel=128,
         # model="anthropic/claude-sonnet-4.5",
-        model="openai/gpt-5",
+        model="allenai/olmo-3-7b-think",
         desc="Sending prompts",
-        max_tokens=4096,
-        reasoning="low",
+        max_tokens=1200,
+        reasoning=1024,
         enable_cache=False,
     )
 

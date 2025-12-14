@@ -2,7 +2,6 @@
 Main Caller class.
 """
 
-import caller.patches
 import os
 import time
 import random
@@ -73,7 +72,6 @@ class RetryConfig(BaseModel):
 
 
 class CallerBaseClass(ABC):
-
     def __init__(
         self, cache_config: Optional[CacheConfig] = None, retry_config: Optional[RetryConfig] = None
     ) -> None:
@@ -248,6 +246,9 @@ class CallerBaseClass(ABC):
     ) -> list[Response|None]:
         """
         Make multiple async API calls in parallel.
+
+        Satisfies: len(output) == len(messages)
+
         See call_one for possible kwargs.
         """
         if not messages:
@@ -309,37 +310,54 @@ class OpenRouterCaller(CallerBaseClass):
         request_body = request.to_openrouter_request()
         if request_body["extra_body"] is None:
             request_body["extra_body"] = {}
-        request_body["extra_body"]["provider"] = {"require_parameters": True}
+
+        # Ask for the provider to support all parameters specified in the request
+        request_body["extra_body"].setdefault("provider", {}).setdefault("require_parameters", True)
 
         # Provider-specific routing (to avoid unreliable providers)
-        if request.model == "meta-llama/llama-3.1-8b-instruct":
-            request_body["extra_body"]["provider"].update(
-                {
-                    "order": ["groq", "deepinfra/turbo", "novita/fp8"],
-                    "allow_fallbacks": False,
-                }
-            )
-        elif request.model == "meta-llama/llama-3.1-70b-instruct":
-            request_body["extra_body"]["provider"].update(
-                {
-                    "order": ["hyperbolic/fp8", "together/fp8"],
-                    "allow_fallbacks": False,
-                }
-            )
-        elif request.model.startswith("anthropic/"):
-            request_body["extra_body"]["provider"].update(
-                {
-                    "order": ["anthropic"],
-                    "allow_fallbacks": False,
-                }
-            )
-        elif request.model.startswith("openai"):
-            request_body["extra_body"]["provider"].update(
-                {
-                    "order": ["openai"],
-                    "allow_fallbacks": False,
-                }
-            )
+        if "order" not in request_body["extra_body"]["provider"]:
+            if request.model == "meta-llama/llama-3.1-8b-instruct":
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["groq", "deepinfra/turbo", "novita/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model == "meta-llama/llama-3.1-70b-instruct":
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["hyperbolic/fp8", "together/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model == "meta-llama/llama-3.2-3b-instruct":
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["cloudflare", "together/fp8", "hyperbolic/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model == "qwen/qwen3-8b":
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["fireworks", "novita/fp8"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model.startswith("anthropic/"):
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["anthropic"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model.startswith("openai"):
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["openai"],
+                        "allow_fallbacks": False,
+                    }
+                )
 
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
@@ -531,8 +549,8 @@ class AnthropicCaller(CallerBaseClass):
 
 class AutoCaller:
     """
-    Exposes only the call method, which automatically
-    selects the appropriate caller to use.
+    Exposes only the :meth:`call` and :meth:`call_one` methods, 
+    which automatically selects the appropriate caller to use.
     """
     def __init__(self,
         dotenv_path: Optional[str | Path] = None,
@@ -556,7 +574,7 @@ class AutoCaller:
                     cache_config=self.cache_config,
                     retry_config=self.retry_config,
                 )
-            except AssertionError as e:
+            except AssertionError:
                 logger.warning("Did not find OPENAI_API_KEY in dotenv_path")
         
         if self.force_caller is None or self.force_caller == "anthropic":
@@ -566,7 +584,7 @@ class AutoCaller:
                     cache_config=self.cache_config,
                     retry_config=self.retry_config,
                 )
-            except AssertionError as e:
+            except AssertionError:
                 logger.warning("Did not find ANTHROPIC_API_KEY in dotenv_path")
             
         if self.force_caller is None or self.force_caller == "openrouter":
@@ -576,7 +594,7 @@ class AutoCaller:
                     cache_config=self.cache_config,
                     retry_config=self.retry_config,
                 )
-            except AssertionError as e:
+            except AssertionError:
                 logger.warning("Did not find OPENROUTER_API_KEY in dotenv_path")
         
         self.anthropic_model_mapping = {
@@ -599,6 +617,7 @@ class AutoCaller:
         desc: Optional[str] = None,
         **kwargs,
     ) -> list[Response|None]:
+        """Satisfies: len(output) == len(messages)"""
         if not messages:
             return []
 
