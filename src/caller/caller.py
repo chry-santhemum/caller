@@ -337,10 +337,17 @@ class OpenRouterCaller(CallerBaseClass):
                         "allow_fallbacks": False,
                     }
                 )
-            elif request.model == "qwen/qwen3-8b":
+            elif request.model == "qwen/qwen-2.5-7b-instruct":
                 request_body["extra_body"]["provider"].update(
                     {
-                        "order": ["fireworks", "novita/fp8"],
+                        "order": ["together/fp8", "phala"],
+                        "allow_fallbacks": False,
+                    }
+                )
+            elif request.model == "qwen/qwen-2.5-72b-instruct":
+                request_body["extra_body"]["provider"].update(
+                    {
+                        "order": ["deepinfra/fp8", "together/fp8"],
                         "allow_fallbacks": False,
                     }
                 )

@@ -29,22 +29,22 @@ async def basic_usage():
     responses = await caller.call(
         messages=messages,
         max_parallel=128,
-        # model="anthropic/claude-sonnet-4.5",
-        model="allenai/olmo-3-7b-think",
+        model="llam",
         desc="Sending prompts",
-        max_tokens=1200,
-        reasoning=1024,
+        max_tokens=1024,
         enable_cache=False,
     )
 
-    for question, response in zip(messages, responses):
-        if response is None:
-            print(f"Question:\n{question}\n")
-            print("Response: None\n")
-            continue
-        print(f"Question:\n{question}\n")
-        print(f"Response:\n{response.first_response}\n")
-        print(f"Reasoning content:\n{response.reasoning_content}\n")
+    for response in responses:
+        print(response)
+    # for question, response in zip(messages, responses):
+    #     if response is None:
+    #         print(f"Question:\n{question}\n")
+    #         print("Response: None\n")
+    #         continue
+    #     print(f"Question:\n{question}\n")
+    #     print(f"Response:\n{response.first_response}\n")
+    #     print(f"Reasoning content:\n{response.reasoning_content}\n")
 
 
 async def cache_demo():
