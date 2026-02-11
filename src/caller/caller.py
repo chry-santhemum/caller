@@ -351,20 +351,6 @@ class OpenRouterCaller(CallerBaseClass):
                         "allow_fallbacks": False,
                     }
                 )
-            elif request.model.startswith("anthropic/"):
-                request_body["extra_body"]["provider"].update(
-                    {
-                        "order": ["anthropic"],
-                        "allow_fallbacks": False,
-                    }
-                )
-            elif request.model.startswith("openai"):
-                request_body["extra_body"]["provider"].update(
-                    {
-                        "order": ["openai"],
-                        "allow_fallbacks": False,
-                    }
-                )
 
         request_body_to_pass = {k: v for k, v in request_body.items() if v is not None}
         try:
